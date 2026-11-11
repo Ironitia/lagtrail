@@ -13,6 +13,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{HLine, Legend, Line, Plot, PlotPoints, Points};
 
+use crate::diagnosis::{self, Finding, HopStat, Severity};
 use crate::engine::{self, EngineCmd, EngineMsg, HopSample, ProbeProtocol};
 
 /// Nombre d'échantillons conservés par saut pour le graphe.
@@ -122,6 +123,57 @@ fn loss_color(pct: f64) -> egui::Color32 {
     }
 }
 
+/// Couleur et pictogramme associés à une gravité de diagnostic.
+fn severity_style(sev: Severity) -> (egui::Color32, &'static str) {
+    match sev {
+        Severity::Ok => (egui::Color32::from_rgb(90, 180, 110), "✔"),
+        Severity::Info => (egui::Color32::from_rgb(120, 160, 210), "ℹ"),
+        Severity::Warning => (egui::Color32::from_rgb(235, 140, 40), "⚠"),
+        Severity::Critical => (egui::Color32::from_rgb(225, 80, 80), "⛔"),
+    }
+}
+
+/// Intervalles prédéfinis (libellé, secondes) — du temps réel à la veille longue.
+const INTERVAL_PRESETS: [(&str, f32); 8] = [
+    ("0,5 s", 0.5),
+    ("1 s", 1.0),
+    ("2,5 s", 2.5),
+    ("5 s", 5.0),
+    ("15 s", 15.0),
+    ("1 min", 60.0),
+    ("5 min", 300.0),
+    ("15 min", 900.0),
+];
+
+fn fmt_interval(secs: f32) -> String {
+    if secs >= 60.0 {
+        format!("{:.0} min", secs / 60.0)
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// Dessine la plage min–max d'un saut (trait fin) et sa moyenne (pastille),
+/// à l'échelle `scale_ms` commune à tout le tableau.
+fn latency_bar(ui: &mut egui::Ui, hop: &HopView, scale_ms: f64, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(40.0), 12.0),
+        egui::Sense::hover(),
+    );
+    let Some(avg) = hop.avg() else { return };
+    if scale_ms <= 0.0 {
+        return;
+    }
+    let x = |ms: f64| rect.left() + (ms / scale_ms).clamp(0.0, 1.0) as f32 * rect.width();
+    let y = rect.center().y;
+    let p = ui.painter();
+    p.line_segment(
+        [egui::pos2(x(hop.best), y), egui::pos2(x(hop.worst), y)],
+        egui::Stroke::new(2.0, color.gamma_multiply(0.55)),
+    );
+    p.circle_filled(egui::pos2(x(avg), y), 3.5, color);
+}
+
 /// Échappe un champ CSV (guillemets si virgule, guillemet ou saut de ligne).
 fn csv_escape(s: &str) -> String {
     if s.contains([',', '"', '\n']) {
@@ -199,7 +251,7 @@ impl Session {
                 (!t.is_empty()).then(|| t.to_string())
             })
             .unwrap_or_else(|| "nouvelle".to_string());
-        let dot = if self.running { "● " } else { "" };
+        let dot = if self.running { "⏺ " } else { "" };
         let warn = if self.alerting_ttls().is_empty() { "" } else { "⚠ " };
         format!("{warn}{dot}{name}")
     }
@@ -222,6 +274,82 @@ impl Session {
             .filter(|h| self.hop_alerts(h))
             .map(|h| h.ttl)
             .collect()
+    }
+
+    /// Statistiques par saut au format attendu par le diagnostic.
+    fn hop_stats(&self) -> Vec<HopStat> {
+        self.hops
+            .iter()
+            .map(|h| HopStat {
+                ttl: h.ttl,
+                sent: h.sent,
+                loss_pct: h.loss_pct(),
+                avg_ms: h.avg(),
+                jitter_ms: h.jitter(),
+            })
+            .collect()
+    }
+
+    /// Constats du diagnostic automatique pour l'état courant.
+    fn findings(&self) -> Vec<Finding> {
+        diagnosis::diagnose(&self.hop_stats(), self.final_ttl.is_some())
+    }
+
+    /// Nom affichable de la cible (résolue si possible, sinon la saisie).
+    fn target_name(&self) -> String {
+        self.resolved
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_else(|| self.target_input.trim().to_string())
+    }
+
+    /// Rapport texte : en-tête, tableau aligné, diagnostic.
+    fn text_report(&self) -> String {
+        let mut out = format!("lagtrail — rapport de trace vers {}", self.target_name());
+        if let Some((_, addr)) = &self.resolved {
+            out.push_str(&format!(" ({addr})"));
+        }
+        let proto = if self.protocol.uses_port() {
+            format!("{} port {}", self.protocol.label(), self.port)
+        } else {
+            self.protocol.label().to_string()
+        };
+        let tours = self.hops.iter().map(|h| h.sent).max().unwrap_or(0);
+        out.push_str(&format!(
+            "\nProtocole : {proto} — {tours} tours, intervalle {} s — durée {:.0} s\n\n",
+            self.interval_secs, self.x
+        ));
+        out.push_str(&format!(
+            "{:>3}  {:<39}  {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {}\n",
+            "#", "Adresse", "Perte", "Moy.", "Min.", "Max.", "Gigue", "Nom"
+        ));
+        for h in &self.hops {
+            out.push_str(&format!(
+                "{:>3}  {:<39}  {:>5.1}%  {:>8}  {:>8}  {:>8}  {:>8}  {}\n",
+                h.ttl,
+                h.addr.map(|a| a.to_string()).unwrap_or_else(|| "*".into()),
+                h.loss_pct(),
+                fmt_ms(h.avg()),
+                fmt_ms(h.best.is_finite().then_some(h.best)),
+                fmt_ms((h.worst > 0.0).then_some(h.worst)),
+                fmt_ms(h.jitter()),
+                h.name.as_deref().unwrap_or(""),
+            ));
+        }
+        let findings = self.findings();
+        if !findings.is_empty() {
+            out.push_str("\nDiagnostic :\n");
+            for f in &findings {
+                let tag = match f.severity {
+                    Severity::Ok => "OK",
+                    Severity::Info => "info",
+                    Severity::Warning => "ATTENTION",
+                    Severity::Critical => "CRITIQUE",
+                };
+                out.push_str(&format!("  [{tag}] {}\n", f.text));
+            }
+        }
+        out
     }
 
     fn start(&mut self) {
@@ -324,10 +452,19 @@ impl Session {
             ui.label("Intervalle :");
             ui.add(
                 egui::DragValue::new(&mut self.interval_secs)
-                    .range(0.2..=10.0)
+                    .range(0.2..=3600.0)
                     .speed(0.05)
                     .suffix(" s"),
-            );
+            )
+            .on_hover_text("Pris en compte au prochain démarrage");
+            egui::ComboBox::from_id_salt("interval_preset")
+                .selected_text(fmt_interval(self.interval_secs))
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    for (label, secs) in INTERVAL_PRESETS {
+                        ui.selectable_value(&mut self.interval_secs, secs, label);
+                    }
+                });
             ui.label("Max sauts :");
             let mut mh = self.max_hops as i32;
             if ui
@@ -359,18 +496,29 @@ impl Session {
             let has = !self.hops.is_empty();
             ui.label("Export :");
             if ui
-                .add_enabled(has, egui::Button::new("⤓ Résumé CSV"))
+                .add_enabled(has, egui::Button::new("💾 Résumé CSV"))
                 .on_hover_text("Exporter le tableau actuel (une ligne par saut)")
                 .clicked()
             {
                 self.export_summary();
             }
             if ui
-                .add_enabled(has, egui::Button::new("⤓ Historique CSV"))
+                .add_enabled(has, egui::Button::new("💾 Historique CSV"))
                 .on_hover_text("Exporter toute la série temporelle (tour × saut)")
                 .clicked()
             {
                 self.export_history();
+            }
+            if ui
+                .add_enabled(has, egui::Button::new("📋 Copier le rapport"))
+                .on_hover_text(
+                    "Copie un rapport texte (tableau + diagnostic) prêt à coller \
+                     dans un ticket de support ou un e-mail",
+                )
+                .clicked()
+            {
+                ui.ctx().copy_text(self.text_report());
+                self.status = "Rapport copié dans le presse-papiers.".to_string();
             }
         });
         ui.add_space(2.0);
@@ -419,6 +567,31 @@ impl Session {
                     .strong(),
             );
         }
+        let findings = self.findings();
+        if !findings.is_empty() {
+            ui.add_space(2.0);
+            egui::CollapsingHeader::new(egui::RichText::new("Diagnostic").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    for f in &findings {
+                        let (color, icon) = severity_style(f.severity);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(color, icon);
+                            let resp = ui.add(
+                                egui::Label::new(&f.text).sense(egui::Sense::click()),
+                            );
+                            if let Some(ttl) = f.ttl {
+                                if resp
+                                    .on_hover_text(format!("Clique pour afficher le saut #{ttl}"))
+                                    .clicked()
+                                {
+                                    self.selected = Some(ttl as usize - 1);
+                                }
+                            }
+                        });
+                    }
+                });
+        }
         ui.add_space(4.0);
     }
 
@@ -438,6 +611,14 @@ impl Session {
         let alerting: HashSet<u8> = self.alerting_ttls().into_iter().collect();
         let hops = &self.hops;
         let mut new_sel = self.selected;
+        // Échelle commune des barres : pire latence du chemin (les routeurs
+        // anormalement lents écrasent sinon tout le reste → plafonnée).
+        let dest_worst = hops.last().map(|h| h.worst).unwrap_or(0.0);
+        let scale_ms = hops
+            .iter()
+            .map(|h| h.worst)
+            .fold(0.0, f64::max)
+            .min((dest_worst * 3.0).max(50.0));
 
         TableBuilder::new(ui)
             .striped(true)
@@ -451,9 +632,11 @@ impl Session {
             .column(Column::exact(64.0))
             .column(Column::exact(64.0))
             .column(Column::exact(64.0))
+            .column(Column::exact(130.0))
             .header(row_h, |mut h| {
                 for t in [
                     "#", "Adresse", "Nom", "Perte", "Dern.", "Moy.", "Min.", "Max.", "Gigue",
+                    "Min — moy — max",
                 ] {
                     h.col(|ui| {
                         ui.strong(t);
@@ -510,6 +693,14 @@ impl Session {
                         });
                         row.col(|ui| {
                             ui.label(fmt_ms(hop.jitter()));
+                        });
+                        row.col(|ui| {
+                            let color = if alerting.contains(&hop.ttl) {
+                                egui::Color32::from_rgb(235, 140, 40)
+                            } else {
+                                loss_color(hop.loss_pct())
+                            };
+                            latency_bar(ui, hop, scale_ms, color);
                         });
                         if row.response().clicked() || clicked {
                             new_sel = Some(i);
@@ -618,14 +809,15 @@ impl Session {
         out
     }
 
-    /// CSV « historique » : une ligne par (tour, saut), format long.
+    /// CSV « historique » : une ligne par (instant, saut), format long ;
+    /// `elapsed_s` = secondes écoulées depuis le démarrage de la trace.
     fn history_csv(&self) -> String {
-        let mut out = String::from("round,hop,address,rtt_ms\n");
+        let mut out = String::from("elapsed_s,hop,address,rtt_ms\n");
         for h in &self.hops {
             let addr = csv_escape(&h.addr.map(|a| a.to_string()).unwrap_or_default());
             for (x, y) in &h.history {
                 let rtt = y.map(|v| format!("{v:.3}")).unwrap_or_default();
-                out.push_str(&format!("{},{},{},{}\n", *x as i64, h.ttl, addr, rtt));
+                out.push_str(&format!("{x:.3},{},{},{}\n", h.ttl, addr, rtt));
             }
         }
         out
@@ -643,11 +835,7 @@ impl Session {
 
     /// Ouvre un dialogue « Enregistrer sous » et écrit le CSV.
     fn save_csv(&mut self, kind: &str, contents: String) {
-        let target = self
-            .resolved
-            .as_ref()
-            .map(|(t, _)| t.clone())
-            .unwrap_or_else(|| self.target_input.trim().to_string());
+        let target = self.target_name();
         let safe: String = target
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
@@ -675,28 +863,42 @@ enum TabAction {
     Select(usize),
     Close(usize),
     Add,
+    Overview,
 }
 
 pub struct App {
     sessions: Vec<Session>,
     active: usize,
+    /// Affiche la vue d'ensemble (toutes les cibles) au lieu d'une trace.
+    overview: bool,
     theme: egui::ThemePreference,
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, initial_target: Option<String>) -> Self {
-        let target = initial_target.unwrap_or_else(|| "1.1.1.1".to_string());
-        let mut session = Session::new(ctx, target.clone());
-        // La cible spéciale « demo » démarre d'elle-même (aucun privilège requis),
-        // avec des alertes pré-réglées pour illustrer la fonction.
-        if target.eq_ignore_ascii_case("demo") {
-            session.alerts_on = true;
-            session.alert_latency = 55.0;
-            session.alert_loss = 8.0;
-            session.start();
+    /// `targets` : cibles passées en ligne de commande. Elles démarrent
+    /// d'elles-mêmes ; à partir de deux, on ouvre sur la vue d'ensemble.
+    pub fn new(ctx: &egui::Context, targets: Vec<String>) -> Self {
+        let mut sessions: Vec<Session> = targets
+            .iter()
+            .map(|target| {
+                let mut session = Session::new(ctx, target.clone());
+                // La cible spéciale « demo » (aucun privilège requis) reçoit
+                // des alertes pré-réglées pour illustrer la fonction.
+                if target.eq_ignore_ascii_case("demo") {
+                    session.alerts_on = true;
+                    session.alert_latency = 55.0;
+                    session.alert_loss = 8.0;
+                }
+                session.start();
+                session
+            })
+            .collect();
+        if sessions.is_empty() {
+            sessions.push(Session::new(ctx, "1.1.1.1".to_string()));
         }
         Self {
-            sessions: vec![session],
+            overview: sessions.len() > 1,
+            sessions,
             active: 0,
             theme: egui::ThemePreference::System,
         }
@@ -704,8 +906,13 @@ impl App {
 
     fn apply_tab_action(&mut self, action: TabAction, ctx: &egui::Context) {
         match action {
-            TabAction::Select(i) => self.active = i,
+            TabAction::Select(i) => {
+                self.active = i;
+                self.overview = false;
+            }
+            TabAction::Overview => self.overview = true,
             TabAction::Add => {
+                self.overview = false;
                 self.sessions.push(Session::new(ctx, "1.1.1.1".to_string()));
                 self.active = self.sessions.len() - 1;
             }
@@ -720,6 +927,100 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Tableau de synthèse : une ligne par cible. Renvoie l'index de la
+    /// session à ouvrir si une ligne a été cliquée.
+    fn overview_table(&mut self, ui: &mut egui::Ui) -> Option<usize> {
+        let mut open = None;
+        let row_h = egui::TextStyle::Body.resolve(ui.style()).size + 10.0;
+        TableBuilder::new(ui)
+            .striped(true)
+            .sense(egui::Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(180.0).at_least(120.0))
+            .column(Column::exact(80.0))
+            .column(Column::exact(60.0))
+            .column(Column::exact(60.0))
+            .column(Column::exact(70.0))
+            .column(Column::exact(70.0))
+            .column(Column::exact(70.0))
+            .column(Column::remainder().at_least(200.0))
+            .header(row_h, |mut h| {
+                for t in ["Cible", "État", "Proto.", "Sauts", "Perte", "Moy.", "Gigue", "Diagnostic"] {
+                    h.col(|ui| {
+                        ui.strong(t);
+                    });
+                }
+            })
+            .body(|mut body| {
+                for (i, s) in self.sessions.iter().enumerate() {
+                    let dest = s.final_ttl.and(s.hops.last());
+                    let findings = s.findings();
+                    body.row(row_h, |mut row| {
+                        row.col(|ui| {
+                            ui.strong(s.target_name());
+                        });
+                        row.col(|ui| {
+                            if s.running {
+                                ui.colored_label(loss_color(0.0), "⏺ en cours");
+                            } else if s.error.is_some() {
+                                ui.colored_label(loss_color(100.0), "erreur");
+                            } else {
+                                ui.weak("arrêtée");
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(s.protocol.label());
+                        });
+                        row.col(|ui| {
+                            ui.label(if s.hops.is_empty() {
+                                "—".to_string()
+                            } else {
+                                s.hops.len().to_string()
+                            });
+                        });
+                        row.col(|ui| match dest {
+                            Some(d) => {
+                                let pct = d.loss_pct();
+                                ui.colored_label(loss_color(pct), format!("{pct:.1} %"));
+                            }
+                            None => {
+                                ui.label("—");
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(fmt_ms(dest.and_then(|d| d.avg())));
+                        });
+                        row.col(|ui| {
+                            ui.label(fmt_ms(dest.and_then(|d| d.jitter())));
+                        });
+                        row.col(|ui| {
+                            if let Some(err) = &s.error {
+                                let first = err.lines().next().unwrap_or_default();
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(first).color(loss_color(100.0)),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(err);
+                            } else if let Some(f) = findings.first() {
+                                let (color, icon) = severity_style(f.severity);
+                                ui.colored_label(color, icon);
+                                ui.add(egui::Label::new(&f.text).truncate())
+                                    .on_hover_text(&f.text);
+                            } else {
+                                ui.weak("—");
+                            }
+                        });
+                        if row.response().clicked() {
+                            open = Some(i);
+                        }
+                    });
+                }
+            });
+        open
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -737,15 +1038,23 @@ impl App {
         let mut action: Option<TabAction> = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(self.overview, "📊 Vue d'ensemble")
+                    .on_hover_text("État de toutes les cibles en un coup d'œil")
+                    .clicked()
+                {
+                    action = Some(TabAction::Overview);
+                }
+                ui.separator();
                 for i in 0..self.sessions.len() {
-                    let selected = self.active == i;
+                    let selected = !self.overview && self.active == i;
                     if ui
                         .selectable_label(selected, self.sessions[i].tab_label())
                         .clicked()
                     {
                         action = Some(TabAction::Select(i));
                     }
-                    if ui.small_button("✕").on_hover_text("Fermer cette trace").clicked() {
+                    if ui.small_button("❌").on_hover_text("Fermer cette trace").clicked() {
                         action = Some(TabAction::Close(i));
                     }
                     ui.separator();
@@ -801,6 +1110,19 @@ impl eframe::App for App {
         let active = self.active.min(self.sessions.len() - 1);
         self.active = active;
 
+        if self.overview {
+            let mut open: Option<usize> = None;
+            egui::CentralPanel::default().show(ui, |ui| open = self.overview_table(ui));
+            if let Some(i) = open {
+                self.active = i;
+                self.overview = false;
+            }
+            if any_running {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+            return;
+        }
+
         egui::Panel::top("controls").show(ui, |ui| self.sessions[active].controls(ui));
         egui::Panel::bottom("plot")
             .resizable(true)
@@ -851,10 +1173,26 @@ mod tests {
         let mut s = Session::new(&egui::Context::default(), "x".into());
         s.hops.push(hop_with_samples());
         let lines: Vec<String> = s.history_csv().lines().map(String::from).collect();
-        assert_eq!(lines[0], "round,hop,address,rtt_ms");
-        assert_eq!(lines[1], "1,1,10.0.0.1,10.000");
-        assert_eq!(lines[2], "2,1,10.0.0.1,"); // timeout → champ RTT vide
-        assert_eq!(lines[3], "3,1,10.0.0.1,20.000");
+        assert_eq!(lines[0], "elapsed_s,hop,address,rtt_ms");
+        assert_eq!(lines[1], "1.000,1,10.0.0.1,10.000");
+        assert_eq!(lines[2], "2.000,1,10.0.0.1,"); // timeout → champ RTT vide
+        assert_eq!(lines[3], "3.000,1,10.0.0.1,20.000");
+    }
+
+    #[test]
+    fn text_report_contains_table_and_diagnosis() {
+        let mut s = Session::new(&egui::Context::default(), "exemple.net".into());
+        let ip = IpAddr::from([10, 0, 0, 1]);
+        let mut h = HopView::new(1);
+        for i in 0..12 {
+            h.record(i as f64, &HopSample { ttl: 1, addr: Some(ip), rtt_ms: Some(5.0) });
+        }
+        s.hops.push(h);
+        s.final_ttl = Some(1);
+        let r = s.text_report();
+        assert!(r.starts_with("lagtrail — rapport de trace vers exemple.net"));
+        assert!(r.contains("10.0.0.1"));
+        assert!(r.contains("[OK] Chemin sain"));
     }
 
     #[test]

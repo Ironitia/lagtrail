@@ -57,7 +57,8 @@ Sans privilèges, l'appli affiche un message clair et ne plante pas.
 
 ```sh
 lagtrail                 # interface graphique (cible par défaut : 1.1.1.1)
-lagtrail exemple.com     # GUI avec la cible pré-remplie
+lagtrail exemple.com     # GUI, la trace démarre aussitôt
+lagtrail box.local 1.1.1.1 exemple.com   # plusieurs cibles : un onglet chacune + vue d'ensemble
 lagtrail demo            # GUI en mode démonstration (données synthétiques, SANS privilèges)
 lagtrail --help
 
@@ -85,12 +86,32 @@ pour afficher sa courbe de latence dans le temps (panneau du bas).
   gigue) et *Historique* (série temporelle complète, une ligne par tour × saut,
   timeouts en champ vide). Ouvre un dialogue « Enregistrer sous ».
 
+## Diagnostic automatique
+
+Un traceroute se lit mal à l'œil nu : un routeur intermédiaire à 30 % de perte
+est le plus souvent **sain** (il limite ses réponses ICMP). lagtrail applique
+les règles de lecture à ta place et affiche des constats en clair :
+
+- une perte (ou une marche de latence) **qui se propage jusqu'à la destination**
+  est attribuée au premier saut où elle apparaît — avec le cas particulier du
+  saut n° 1 (réseau local : Wi-Fi, câble, box) et de la destination seule ;
+- une perte ou une latence élevée **non répercutée en aval** est signalée comme
+  bénigne (limitation de débit / faible priorité des réponses du routeur) ;
+- destination injoignable : dernier équipement visible ; gigue excessive ;
+  rien n'est conclu avant 10 tours ni sur moins de 3 paquets perdus.
+
+Cliquer un constat sélectionne le saut concerné. **📋 Copier le rapport** place
+dans le presse-papiers un rapport texte (tableau aligné + diagnostic) prêt à
+coller dans un ticket de support. La **vue d'ensemble** résume toutes les
+cibles ouvertes (état, perte, latence, verdict) ; un clic ouvre la trace.
+
 ## Architecture
 
 | Fichier         | Rôle                                                          |
 |-----------------|---------------------------------------------------------------|
 | `src/icmp.rs`   | Encodage/décodage ICMPv4 + parsing IPv4 (fait main, portable). Tests unitaires de la somme de contrôle et de l'appariement. |
 | `src/engine.rs` | Moteur de sonde : socket raw, boucle de tours, résolution DNS directe/inverse. Tourne dans un thread, communique par canaux. |
+| `src/diagnosis.rs` | Diagnostic automatique du chemin (fonctions pures, testées). |
 | `src/app.rs`    | Interface egui : barre de contrôle, tableau des sauts, graphe de latence. |
 | `src/main.rs`   | Point d'entrée : GUI par défaut, mode `--selftest` headless.   |
 
@@ -110,7 +131,9 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 Multi-traces en onglets · thème clair/sombre/auto · protocoles ICMP/UDP/TCP ·
 IPv4 **et** IPv6 · alertes sur seuils (latence/perte) · graphe latence/temps avec
-marqueurs de perte · export CSV (résumé + historique) · DNS inverse · mode démo.
+marqueurs de perte · export CSV (résumé + historique) · DNS inverse · mode démo · **diagnostic
+automatique** · rapport texte copiable · vue d'ensemble multi-cibles · barre
+min/moy/max par saut · intervalles de 0,2 s à 60 min (veille longue).
 
 ## Limites actuelles / pistes
 
@@ -124,5 +147,5 @@ marqueurs de perte · export CSV (résumé + historique) · DNS inverse · mode 
 ## Tests
 
 ```sh
-cargo test        # valide l'encodage ICMP, la somme de contrôle et l'appariement des réponses
+cargo test        # encodage ICMP, appariement des réponses, exports, règles de diagnostic
 ```

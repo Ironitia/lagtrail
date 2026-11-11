@@ -421,7 +421,7 @@ pub fn socket_error_message(e: &io::Error) -> String {
                 .to_string();
         }
         return "Permission refusée : les sockets ICMP bruts demandent des privilèges.\n\
-                → lance avec « sudo lagtrail », ou autorise le binaire une fois \
+                Lance avec « sudo lagtrail », ou autorise le binaire une fois \
                 pour toutes :  sudo setcap cap_net_raw+ep <chemin-du-binaire>"
             .to_string();
     }

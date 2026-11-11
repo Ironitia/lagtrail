@@ -16,6 +16,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod diagnosis;
 mod engine;
 mod icmp;
 
@@ -26,7 +27,8 @@ fn print_help() {
     println!(
         "lagtrail — traceroute visuel continu\n\n\
          USAGE :\n\
-         \x20 lagtrail [cible]              interface graphique (cible optionnelle)\n\
+         \x20 lagtrail [cible ...]          interface graphique ; chaque cible démarre\n\
+         \x20                              dans son onglet (« demo » = sans privilèges)\n\
          \x20 lagtrail --selftest <cible>   trace dans le terminal (diagnostic)\n\
          \x20 lagtrail --help               cette aide\n\n\
          PRIVILÈGES : socket ICMP brut requis.\n\
@@ -58,11 +60,15 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    let initial_target = args.get(1).filter(|a| !a.starts_with('-')).cloned();
+    let targets: Vec<String> = args[1..]
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 660.0])
+            .with_inner_size([1040.0, 760.0])
             .with_min_inner_size([680.0, 420.0])
             .with_title("lagtrail — traceroute visuel"),
         ..Default::default()
@@ -71,7 +77,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "lagtrail",
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(&cc.egui_ctx, initial_target)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(&cc.egui_ctx, targets)))),
     )
 }
 
