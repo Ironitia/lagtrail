@@ -62,6 +62,11 @@ lagtrail box.local 1.1.1.1 exemple.com   # plusieurs cibles : un onglet chacune 
 lagtrail demo            # GUI en mode démonstration (données synthétiques, SANS privilèges)
 lagtrail --help
 
+# Rapport sans interface, pour un script, une tâche cron ou une supervision :
+lagtrail --report exemple.com                       # 20 tours ICMP, tableau + diagnostic
+lagtrail --report exemple.com tcp 443 --rounds 60 --interval 0.5
+#   code de sortie : 0 = sain, 1 = attention, 2 = critique, 3 = erreur
+
 # Diagnostic terminal (sans GUI). Protocole et port optionnels :
 lagtrail --selftest 8.8.8.8            # ICMP
 lagtrail --selftest exemple.com tcp 443
@@ -105,6 +110,17 @@ dans le presse-papiers un rapport texte (tableau aligné + diagnostic) prêt à
 coller dans un ticket de support. La **vue d'ensemble** résume toutes les
 cibles ouvertes (état, perte, latence, verdict) ; un clic ouvre la trace.
 
+**Changements de route** : quand l'adresse qui répond à un saut change, le
+tableau l'indique (🔀, avec la liste des adresses vues) et le diagnostic
+distingue une alternance régulière (répartition de charge) d'une bascule
+ponctuelle. La colonne `route_changes` figure dans le CSV résumé.
+
+**Onglets mémorisés** : lancé sans argument, lagtrail rouvre les onglets et le
+thème de la dernière fois (cibles, protocole, intervalle, seuils d'alerte),
+sans démarrer aucune trace. Fichier : `~/.config/lagtrail/session.conf`
+(`%APPDATA%\lagtrail` sous Windows). Un lancement avec des cibles en argument
+ne modifie pas ce fichier.
+
 ## Architecture
 
 | Fichier         | Rôle                                                          |
@@ -112,8 +128,10 @@ cibles ouvertes (état, perte, latence, verdict) ; un clic ouvre la trace.
 | `src/icmp.rs`   | Encodage/décodage ICMPv4 + parsing IPv4 (fait main, portable). Tests unitaires de la somme de contrôle et de l'appariement. |
 | `src/engine.rs` | Moteur de sonde : socket raw, boucle de tours, résolution DNS directe/inverse. Tourne dans un thread, communique par canaux. |
 | `src/diagnosis.rs` | Diagnostic automatique du chemin (fonctions pures, testées). |
+| `src/stats.rs`  | Agrégation par saut, changements de route, rapport texte (partagé GUI / `--report`). |
+| `src/config.rs` | Mémorisation des onglets et du thème (format texte, sans dépendance). |
 | `src/app.rs`    | Interface egui : barre de contrôle, tableau des sauts, graphe de latence. |
-| `src/main.rs`   | Point d'entrée : GUI par défaut, mode `--selftest` headless.   |
+| `src/main.rs`   | Point d'entrée : GUI par défaut, modes `--report` et `--selftest` sans interface. |
 
 Le moteur et l'IHM sont découplés par deux canaux `mpsc` (`EngineCmd` ↔ `EngineMsg`),
 donc le réseau ne bloque jamais le rendu.
@@ -133,15 +151,22 @@ Multi-traces en onglets · thème clair/sombre/auto · protocoles ICMP/UDP/TCP �
 IPv4 **et** IPv6 · alertes sur seuils (latence/perte) · graphe latence/temps avec
 marqueurs de perte · export CSV (résumé + historique) · DNS inverse · mode démo · **diagnostic
 automatique** · rapport texte copiable · vue d'ensemble multi-cibles · barre
-min/moy/max par saut · intervalles de 0,2 s à 60 min (veille longue).
+min/moy/max par saut · intervalles de 0,2 s à 60 min (veille longue) ·
+détection des changements de route · mode `--report` scriptable · onglets
+mémorisés entre deux lancements.
 
 ## Limites actuelles / pistes
 
-- **Les modes réseau (ICMP/UDP/TCP, IPv4/IPv6) n'ont pas encore été validés en
-  conditions réelles dans cet environnement** (manque de `CAP_NET_RAW`) : le
-  parsing des paquets est couvert par des tests unitaires, mais le chemin
-  socket mérite une passe de validation live. Le mode démo, lui, est validé.
-- Sauvegarde/chargement de session et export image : à faire.
+- **Validation réelle** : ICMP, UDP et TCP ont été vérifiés en IPv4 sur un vrai
+  chemin Internet, avec des latences concordantes avec `mtr`. **IPv6 n'a pas
+  pu être validé** (pas de route IPv6 sur la machine d'essai) : seul le parsing
+  ICMPv6 est couvert par des tests unitaires.
+- Au premier tour, toutes les sondes au-delà du dernier saut atteignent la
+  destination en rafale ; une cible qui limite ses réponses (fréquent en UDP)
+  peut alors afficher une perte qui n'existe pas pour le trafic réel.
+- En TCP, la latence de la destination est mesurée à environ 1 ms près.
+- Les mesures elles-mêmes ne sont pas rechargées d'une session à l'autre
+  (seuls les réglages le sont) ; export image : à faire.
 - Le dialogue d'export utilise GTK3 sous Linux (headers requis à la compilation).
 
 ## Tests

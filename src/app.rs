@@ -4,7 +4,7 @@
 //! `Session` indépendante (sa cible, son thread moteur, ses mesures). Un
 //! sélecteur de thème clair/sombre/auto est disponible en haut.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -13,104 +13,10 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{HLine, Legend, Line, Plot, PlotPoints, Points};
 
-use crate::diagnosis::{self, Finding, HopStat, Severity};
-use crate::engine::{self, EngineCmd, EngineMsg, HopSample, ProbeProtocol};
-
-/// Nombre d'échantillons conservés par saut pour le graphe.
-const HISTORY: usize = 600;
-
-// ───────────────────────────── Vue d'un saut ─────────────────────────────
-
-/// État affiché d'un saut (agrège les tours successifs).
-struct HopView {
-    ttl: u8,
-    addr: Option<IpAddr>,
-    name: Option<String>,
-    sent: u64,
-    recv: u64,
-    last: Option<f64>,
-    best: f64,
-    worst: f64,
-    sum: f64,
-    prev: Option<f64>,
-    jitter_sum: f64,
-    jitter_n: u64,
-    /// (x = numéro de tour, y = RTT en ms ; None = timeout)
-    history: VecDeque<(f64, Option<f64>)>,
-}
-
-impl HopView {
-    fn new(ttl: u8) -> Self {
-        Self {
-            ttl,
-            addr: None,
-            name: None,
-            sent: 0,
-            recv: 0,
-            last: None,
-            best: f64::INFINITY,
-            worst: 0.0,
-            sum: 0.0,
-            prev: None,
-            jitter_sum: 0.0,
-            jitter_n: 0,
-            history: VecDeque::new(),
-        }
-    }
-
-    fn loss_pct(&self) -> f64 {
-        if self.sent == 0 {
-            0.0
-        } else {
-            (self.sent - self.recv) as f64 / self.sent as f64 * 100.0
-        }
-    }
-
-    fn avg(&self) -> Option<f64> {
-        (self.recv > 0).then(|| self.sum / self.recv as f64)
-    }
-
-    fn jitter(&self) -> Option<f64> {
-        (self.jitter_n > 0).then(|| self.jitter_sum / self.jitter_n as f64)
-    }
-
-    fn record(&mut self, x: f64, s: &HopSample) {
-        if let Some(a) = s.addr {
-            self.addr = Some(a);
-        }
-        self.sent += 1;
-        match s.rtt_ms {
-            Some(rtt) => {
-                self.recv += 1;
-                self.last = Some(rtt);
-                self.sum += rtt;
-                if rtt < self.best {
-                    self.best = rtt;
-                }
-                if rtt > self.worst {
-                    self.worst = rtt;
-                }
-                if let Some(p) = self.prev {
-                    self.jitter_sum += (rtt - p).abs();
-                    self.jitter_n += 1;
-                }
-                self.prev = Some(rtt);
-            }
-            None => self.last = None,
-        }
-        self.history.push_back((x, s.rtt_ms));
-        while self.history.len() > HISTORY {
-            self.history.pop_front();
-        }
-    }
-}
-
-fn fmt_ms(v: Option<f64>) -> String {
-    match v {
-        Some(x) if x.is_finite() => format!("{x:.1}"),
-        _ => "—".to_string(),
-    }
-}
+use crate::config::{self, SavedState, TraceConfig};
+use crate::diagnosis::{Finding, Severity};
+use crate::engine::{self, EngineCmd, EngineMsg, ProbeProtocol};
+use crate::stats::{self, HopView, ReportMeta, fmt_ms};
 
 /// Couleur d'une cellule « perte » selon le pourcentage.
 fn loss_color(pct: f64) -> egui::Color32 {
@@ -197,6 +103,8 @@ struct Session {
     error: Option<String>,
     resolved: Option<(String, IpAddr)>,
     hops: Vec<HopView>,
+    /// Cache DNS inverse de la trace (adresse → nom).
+    names: HashMap<IpAddr, String>,
     final_ttl: Option<u8>,
     selected: Option<usize>,
     x: f64,
@@ -227,6 +135,7 @@ impl Session {
             error: None,
             resolved: None,
             hops: Vec::new(),
+            names: HashMap::new(),
             final_ttl: None,
             selected: None,
             x: 0.0,
@@ -276,23 +185,9 @@ impl Session {
             .collect()
     }
 
-    /// Statistiques par saut au format attendu par le diagnostic.
-    fn hop_stats(&self) -> Vec<HopStat> {
-        self.hops
-            .iter()
-            .map(|h| HopStat {
-                ttl: h.ttl,
-                sent: h.sent,
-                loss_pct: h.loss_pct(),
-                avg_ms: h.avg(),
-                jitter_ms: h.jitter(),
-            })
-            .collect()
-    }
-
     /// Constats du diagnostic automatique pour l'état courant.
     fn findings(&self) -> Vec<Finding> {
-        diagnosis::diagnose(&self.hop_stats(), self.final_ttl.is_some())
+        stats::findings(&self.hops, self.final_ttl.is_some())
     }
 
     /// Nom affichable de la cible (résolue si possible, sinon la saisie).
@@ -305,51 +200,42 @@ impl Session {
 
     /// Rapport texte : en-tête, tableau aligné, diagnostic.
     fn text_report(&self) -> String {
-        let mut out = format!("lagtrail — rapport de trace vers {}", self.target_name());
-        if let Some((_, addr)) = &self.resolved {
-            out.push_str(&format!(" ({addr})"));
-        }
-        let proto = if self.protocol.uses_port() {
-            format!("{} port {}", self.protocol.label(), self.port)
-        } else {
-            self.protocol.label().to_string()
+        let meta = ReportMeta {
+            target: self.target_name(),
+            addr: self.resolved.as_ref().map(|(_, a)| *a),
+            protocol: self.protocol.describe(self.port),
+            interval_secs: self.interval_secs,
+            elapsed_secs: self.x,
         };
-        let tours = self.hops.iter().map(|h| h.sent).max().unwrap_or(0);
-        out.push_str(&format!(
-            "\nProtocole : {proto} — {tours} tours, intervalle {} s — durée {:.0} s\n\n",
-            self.interval_secs, self.x
-        ));
-        out.push_str(&format!(
-            "{:>3}  {:<39}  {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {}\n",
-            "#", "Adresse", "Perte", "Moy.", "Min.", "Max.", "Gigue", "Nom"
-        ));
-        for h in &self.hops {
-            out.push_str(&format!(
-                "{:>3}  {:<39}  {:>5.1}%  {:>8}  {:>8}  {:>8}  {:>8}  {}\n",
-                h.ttl,
-                h.addr.map(|a| a.to_string()).unwrap_or_else(|| "*".into()),
-                h.loss_pct(),
-                fmt_ms(h.avg()),
-                fmt_ms(h.best.is_finite().then_some(h.best)),
-                fmt_ms((h.worst > 0.0).then_some(h.worst)),
-                fmt_ms(h.jitter()),
-                h.name.as_deref().unwrap_or(""),
-            ));
+        stats::text_report(&meta, &self.hops, self.final_ttl.is_some())
+    }
+
+    /// Réglages mémorisables de cet onglet.
+    fn to_config(&self) -> TraceConfig {
+        TraceConfig {
+            target: self.target_input.trim().to_string(),
+            protocol: self.protocol,
+            port: self.port,
+            interval_secs: self.interval_secs,
+            max_hops: self.max_hops,
+            prefer_v6: self.prefer_v6,
+            alerts_on: self.alerts_on,
+            alert_latency: self.alert_latency,
+            alert_loss: self.alert_loss,
         }
-        let findings = self.findings();
-        if !findings.is_empty() {
-            out.push_str("\nDiagnostic :\n");
-            for f in &findings {
-                let tag = match f.severity {
-                    Severity::Ok => "OK",
-                    Severity::Info => "info",
-                    Severity::Warning => "ATTENTION",
-                    Severity::Critical => "CRITIQUE",
-                };
-                out.push_str(&format!("  [{tag}] {}\n", f.text));
-            }
-        }
-        out
+    }
+
+    fn from_config(ctx: &egui::Context, c: &TraceConfig) -> Self {
+        let mut s = Session::new(ctx, c.target.clone());
+        s.protocol = c.protocol;
+        s.port = c.port;
+        s.interval_secs = c.interval_secs;
+        s.max_hops = c.max_hops;
+        s.prefer_v6 = c.prefer_v6;
+        s.alerts_on = c.alerts_on;
+        s.alert_latency = c.alert_latency;
+        s.alert_loss = c.alert_loss;
+        s
     }
 
     fn start(&mut self) {
@@ -360,6 +246,7 @@ impl Session {
         }
         self.error = None;
         self.hops.clear();
+        self.names.clear();
         self.final_ttl = None;
         self.selected = None;
         self.resolved = None;
@@ -398,25 +285,19 @@ impl Session {
                         .start
                         .map(|s| s.elapsed().as_secs_f64())
                         .unwrap_or(self.x + 1.0);
-                    for s in &samples {
-                        let idx = (s.ttl as usize).saturating_sub(1);
-                        while self.hops.len() <= idx {
-                            let ttl = (self.hops.len() + 1) as u8;
-                            self.hops.push(HopView::new(ttl));
-                        }
-                        self.hops[idx].record(self.x, s);
-                    }
+                    stats::apply_round(&mut self.hops, &self.names, self.x, final_ttl, &samples);
                     if let Some(ft) = final_ttl {
-                        self.hops.truncate(ft as usize);
-                        if self.selected.is_none() {
-                            self.selected = Some(ft as usize - 1);
+                        // Le saut final peut encore reculer aux tours suivants
+                        // (réponse de la destination perdue au premier tour) :
+                        // une sélection devenue hors limites suit la destination.
+                        let last = (ft as usize).saturating_sub(1);
+                        if self.selected.is_none_or(|i| i >= self.hops.len()) {
+                            self.selected = Some(last.min(self.hops.len().saturating_sub(1)));
                         }
                     }
                 }
-                EngineMsg::HopName { ttl, name } => {
-                    if let Some(h) = self.hops.get_mut(ttl as usize - 1) {
-                        h.name = Some(name);
-                    }
+                EngineMsg::HopName { addr, name } => {
+                    stats::apply_name(&mut self.hops, &mut self.names, addr, name);
                 }
                 EngineMsg::Error(e) => {
                     self.error = Some(e);
@@ -609,7 +490,9 @@ impl Session {
 
         let row_h = egui::TextStyle::Body.resolve(ui.style()).size + 8.0;
         let alerting: HashSet<u8> = self.alerting_ttls().into_iter().collect();
-        let hops = &self.hops;
+        // Destination non atteinte : on masque la traîne de sauts muets.
+        let shown = stats::visible_len(&self.hops, self.final_ttl.is_some());
+        let hops = &self.hops[..shown];
         let mut new_sel = self.selected;
         // Échelle commune des barres : pire latence du chemin (les routeurs
         // anormalement lents écrasent sinon tout le reste → plafonnée).
@@ -666,13 +549,29 @@ impl Session {
                             if ui.monospace(s).clicked() {
                                 clicked = true;
                             }
+                            if hop.route_changes > 0 {
+                                let seen = hop
+                                    .addrs
+                                    .iter()
+                                    .map(|a| a.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                ui.label(egui::RichText::new("🔀").weak()).on_hover_text(format!(
+                                    "Route instable : {} changement(s) d'adresse à ce saut.\n\
+                                     Adresses vues :\n{seen}",
+                                    hop.route_changes
+                                ));
+                            }
                         });
                         row.col(|ui| {
                             let s = hop
                                 .name
                                 .clone()
                                 .or_else(|| hop.addr.map(|a| a.to_string()))
-                                .unwrap_or_else(|| "(en attente)".into());
+                                .unwrap_or_else(|| {
+                                    if hop.sent >= 3 { "(ne répond pas)" } else { "(en attente)" }
+                                        .into()
+                                });
                             ui.label(s);
                         });
                         row.col(|ui| {
@@ -686,10 +585,10 @@ impl Session {
                             ui.label(fmt_ms(hop.avg()));
                         });
                         row.col(|ui| {
-                            ui.label(fmt_ms((hop.best.is_finite()).then_some(hop.best)));
+                            ui.label(fmt_ms(hop.min()));
                         });
                         row.col(|ui| {
-                            ui.label(fmt_ms((hop.worst > 0.0).then_some(hop.worst)));
+                            ui.label(fmt_ms(hop.max()));
                         });
                         row.col(|ui| {
                             ui.label(fmt_ms(hop.jitter()));
@@ -784,15 +683,13 @@ impl Session {
     fn summary_csv(&self) -> String {
         let f = |v: Option<f64>| v.map(|x| format!("{x:.3}")).unwrap_or_default();
         let mut out = String::from(
-            "hop,address,hostname,sent,recv,loss_pct,last_ms,avg_ms,min_ms,max_ms,jitter_ms\n",
+            "hop,address,hostname,sent,recv,loss_pct,last_ms,avg_ms,min_ms,max_ms,jitter_ms,route_changes\n",
         );
         for h in &self.hops {
             let addr = h.addr.map(|a| a.to_string()).unwrap_or_default();
             let name = h.name.clone().unwrap_or_default();
-            let min = h.best.is_finite().then_some(h.best);
-            let max = (h.worst > 0.0).then_some(h.worst);
             out.push_str(&format!(
-                "{},{},{},{},{},{:.2},{},{},{},{},{}\n",
+                "{},{},{},{},{},{:.2},{},{},{},{},{},{}\n",
                 h.ttl,
                 csv_escape(&addr),
                 csv_escape(&name),
@@ -801,9 +698,10 @@ impl Session {
                 h.loss_pct(),
                 f(h.last),
                 f(h.avg()),
-                f(min),
-                f(max),
+                f(h.min()),
+                f(h.max()),
                 f(h.jitter()),
+                h.route_changes,
             ));
         }
         out
@@ -872,6 +770,9 @@ pub struct App {
     /// Affiche la vue d'ensemble (toutes les cibles) au lieu d'une trace.
     overview: bool,
     theme: egui::ThemePreference,
+    /// Mémoriser les onglets à la fermeture (désactivé quand des cibles ont
+    /// été passées en ligne de commande : lancement ponctuel).
+    persist: bool,
 }
 
 impl App {
@@ -893,6 +794,21 @@ impl App {
                 session
             })
             .collect();
+        // Sans cible explicite : on rouvre les onglets de la dernière fois
+        // (sans les démarrer — aucune sonde ne part sans action de ta part).
+        let mut theme = egui::ThemePreference::System;
+        let restore = sessions.is_empty();
+        if let Some(saved) = config::load() {
+            theme = match saved.theme.as_str() {
+                "light" => egui::ThemePreference::Light,
+                "dark" => egui::ThemePreference::Dark,
+                _ => egui::ThemePreference::System,
+            };
+            ctx.set_theme(theme);
+            if restore {
+                sessions = saved.traces.iter().map(|c| Session::from_config(ctx, c)).collect();
+            }
+        }
         if sessions.is_empty() {
             sessions.push(Session::new(ctx, "1.1.1.1".to_string()));
         }
@@ -900,7 +816,26 @@ impl App {
             overview: sessions.len() > 1,
             sessions,
             active: 0,
-            theme: egui::ThemePreference::System,
+            theme,
+            persist: restore,
+        }
+    }
+
+    /// État à mémoriser (les onglets « demo » ou vides sont ignorés).
+    fn saved_state(&self) -> SavedState {
+        SavedState {
+            theme: match self.theme {
+                egui::ThemePreference::Light => "light",
+                egui::ThemePreference::Dark => "dark",
+                egui::ThemePreference::System => "system",
+            }
+            .to_string(),
+            traces: self
+                .sessions
+                .iter()
+                .map(Session::to_config)
+                .filter(|c| !c.target.is_empty() && !c.target.eq_ignore_ascii_case("demo"))
+                .collect(),
         }
     }
 
@@ -1083,6 +1018,14 @@ fn theme_button(
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if self.persist {
+            let _ = config::save(&self.saved_state());
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Draine les messages de TOUTES les sessions (les traces de fond
@@ -1141,14 +1084,15 @@ impl eframe::App for App {
 mod tests {
     use super::*;
     use crate::engine::HopSample;
+    use crate::stats::HopView;
 
     fn hop_with_samples() -> HopView {
         let mut h = HopView::new(1);
         let ip = IpAddr::from([10, 0, 0, 1]);
-        h.name = Some("routeur.local".to_string());
         h.record(1.0, &HopSample { ttl: 1, addr: Some(ip), rtt_ms: Some(10.0) });
         h.record(2.0, &HopSample { ttl: 1, addr: Some(ip), rtt_ms: None }); // perte
         h.record(3.0, &HopSample { ttl: 1, addr: Some(ip), rtt_ms: Some(20.0) });
+        h.name = Some("routeur.local".to_string());
         h
     }
 
@@ -1159,12 +1103,12 @@ mod tests {
         let lines: Vec<String> = s.summary_csv().lines().map(String::from).collect();
         assert_eq!(
             lines[0],
-            "hop,address,hostname,sent,recv,loss_pct,last_ms,avg_ms,min_ms,max_ms,jitter_ms"
+            "hop,address,hostname,sent,recv,loss_pct,last_ms,avg_ms,min_ms,max_ms,jitter_ms,route_changes"
         );
         // 3 envoyés, 2 reçus → perte 33,33 % ; min 10 / max 20 / moy 15 / gigue 10
         assert_eq!(
             lines[1],
-            "1,10.0.0.1,routeur.local,3,2,33.33,20.000,15.000,10.000,20.000,10.000"
+            "1,10.0.0.1,routeur.local,3,2,33.33,20.000,15.000,10.000,20.000,10.000,0"
         );
     }
 
@@ -1177,22 +1121,6 @@ mod tests {
         assert_eq!(lines[1], "1.000,1,10.0.0.1,10.000");
         assert_eq!(lines[2], "2.000,1,10.0.0.1,"); // timeout → champ RTT vide
         assert_eq!(lines[3], "3.000,1,10.0.0.1,20.000");
-    }
-
-    #[test]
-    fn text_report_contains_table_and_diagnosis() {
-        let mut s = Session::new(&egui::Context::default(), "exemple.net".into());
-        let ip = IpAddr::from([10, 0, 0, 1]);
-        let mut h = HopView::new(1);
-        for i in 0..12 {
-            h.record(i as f64, &HopSample { ttl: 1, addr: Some(ip), rtt_ms: Some(5.0) });
-        }
-        s.hops.push(h);
-        s.final_ttl = Some(1);
-        let r = s.text_report();
-        assert!(r.starts_with("lagtrail — rapport de trace vers exemple.net"));
-        assert!(r.contains("10.0.0.1"));
-        assert!(r.contains("[OK] Chemin sain"));
     }
 
     #[test]

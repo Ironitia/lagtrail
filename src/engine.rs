@@ -43,6 +43,15 @@ impl ProbeProtocol {
         }
     }
     /// Un port de destination est-il pertinent (UDP/TCP) ?
+    /// Libellé complet, port compris s'il a un sens (« TCP port 443 »).
+    pub fn describe(self, port: u16) -> String {
+        if self.uses_port() {
+            format!("{} port {port}", self.label())
+        } else {
+            self.label().to_string()
+        }
+    }
+
     pub fn uses_port(self) -> bool {
         matches!(self, ProbeProtocol::Udp | ProbeProtocol::Tcp)
     }
@@ -84,7 +93,8 @@ pub enum EngineMsg {
         final_ttl: Option<u8>,
         samples: Vec<HopSample>,
     },
-    HopName { ttl: u8, name: String },
+    /// Nom (DNS inverse) d'une adresse rencontrée sur le chemin.
+    HopName { addr: IpAddr, name: String },
     Error(String),
     Stopped,
 }
@@ -337,8 +347,12 @@ impl Prober {
 
         while Instant::now() < deadline && !(sent_at.is_empty() && tcp.is_empty()) {
             let remaining = deadline.saturating_duration_since(Instant::now());
+            // Tant que des connexions TCP sont en attente, on les scrute à
+            // chaque passage : l'attente ICMP doit rester très courte, sinon
+            // elle s'ajoute au RTT mesuré de la destination (jusqu'à 80 ms).
+            let slice = if tcp.is_empty() { 80 } else { 1 };
             let to = remaining
-                .min(Duration::from_millis(80))
+                .min(Duration::from_millis(slice))
                 .max(Duration::from_millis(1));
             self.recv.set_read_timeout(Some(to))?;
             match self.recv.recv_from(&mut buf) {
@@ -429,11 +443,11 @@ pub fn socket_error_message(e: &io::Error) -> String {
 }
 
 /// Lance la résolution inverse (PTR) d'un saut dans un thread détaché.
-fn spawn_reverse_dns(ttl: u8, ip: IpAddr, tx: Sender<EngineMsg>) {
+fn spawn_reverse_dns(ip: IpAddr, tx: Sender<EngineMsg>) {
     std::thread::spawn(move || {
         if let Ok(name) = dns_lookup::lookup_addr(&ip) {
             if name != ip.to_string() {
-                let _ = tx.send(EngineMsg::HopName { ttl, name });
+                let _ = tx.send(EngineMsg::HopName { addr: ip, name });
             }
         }
     });
@@ -477,10 +491,13 @@ fn run_demo(
         (target_ip, 58.0, "demo.cible"),
     ];
     let final_ttl = path.len() as u8;
-    for (i, (_, _, name)) in path.iter().enumerate() {
+    // Le saut 4 alterne entre deux routeurs (répartition de charge simulée).
+    let alt_hop = 3;
+    let alt_ip = IpAddr::from([172, 16, 5, 2]);
+    for (ip, _, name) in path.iter() {
         if !name.is_empty() {
             let _ = msg_tx.send(EngineMsg::HopName {
-                ttl: (i + 1) as u8,
+                addr: *ip,
                 name: (*name).to_string(),
             });
         }
@@ -517,9 +534,14 @@ fn run_demo(
                 let jitter = ((xorshift(&mut rng) % 1000) as f64 / 1000.0 - 0.5) * span;
                 Some((base + jitter).max(0.3))
             };
+            let ip = if i == alt_hop && xorshift(&mut rng) % 3 == 0 {
+                alt_ip
+            } else {
+                *ip
+            };
             samples.push(HopSample {
                 ttl: (i + 1) as u8,
-                addr: Some(*ip),
+                addr: Some(ip),
                 rtt_ms: rtt,
             });
         }
@@ -614,7 +636,7 @@ fn engine_loop(cmd_rx: Receiver<EngineCmd>, msg_tx: Sender<EngineMsg>, repaint: 
         let payload = make_payload();
         let mut round: u8 = 0;
         let mut final_ttl: Option<u8> = None;
-        let mut named: HashSet<u8> = HashSet::new();
+        let mut named: HashSet<IpAddr> = HashSet::new();
 
         let _ = msg_tx.send(EngineMsg::Started);
         repaint();
@@ -644,8 +666,10 @@ fn engine_loop(cmd_rx: Receiver<EngineCmd>, msg_tx: Sender<EngineMsg>, repaint: 
                     }
                     for s in &outcome.samples {
                         if let Some(ip) = s.addr {
-                            if named.insert(s.ttl) {
-                                spawn_reverse_dns(s.ttl, ip, msg_tx.clone());
+                            // Une résolution par adresse : une route qui
+                            // alterne ne relance pas de requêtes en boucle.
+                            if named.insert(ip) {
+                                spawn_reverse_dns(ip, msg_tx.clone());
                             }
                         }
                     }

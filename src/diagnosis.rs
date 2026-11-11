@@ -15,6 +15,8 @@ pub struct HopStat {
     pub loss_pct: f64,
     pub avg_ms: Option<f64>,
     pub jitter_ms: Option<f64>,
+    /// Nombre de changements d'adresse observés à ce TTL.
+    pub route_changes: u32,
 }
 
 impl HopStat {
@@ -48,6 +50,8 @@ const DEST_LOSS_WARN: f64 = 2.0;
 const DEST_LOSS_CRIT: f64 = 10.0;
 /// Nombre minimal de paquets perdus à destination pour parler de perte.
 const MIN_LOST: f64 = 3.0;
+/// Nombre de changements d'adresse à partir duquel on parle d'alternance.
+const ROUTE_FLAP: u32 = 3;
 /// Perte d'un saut intermédiaire méritant une mention (%).
 const HOP_LOSS_NOTE: f64 = 5.0;
 /// Saut de latence méritant une mention (ms).
@@ -193,6 +197,42 @@ pub fn diagnose(hops: &[HopStat], reached: bool) -> Vec<Finding> {
         ));
     }
 
+    // ── Stabilité de la route ────────────────────────────────────────────
+    let flapping: Vec<u8> = hops
+        .iter()
+        .filter(|h| h.route_changes >= ROUTE_FLAP)
+        .map(|h| h.ttl)
+        .collect();
+    let moved: Vec<u8> = hops
+        .iter()
+        .filter(|h| h.route_changes > 0 && h.route_changes < ROUTE_FLAP)
+        .map(|h| h.ttl)
+        .collect();
+    if !flapping.is_empty() {
+        out.push(finding(
+            Severity::Info,
+            flapping.first().copied(),
+            format!(
+                "Route alternante au(x) saut(s) {} : plusieurs routeurs répondent à tour \
+                 de rôle (répartition de charge). Normal, mais les statistiques de ces \
+                 sauts mélangent plusieurs chemins.",
+                list(&flapping)
+            ),
+        ));
+    }
+    if !moved.is_empty() {
+        out.push(finding(
+            Severity::Info,
+            moved.first().copied(),
+            format!(
+                "Changement de route observé au(x) saut(s) {} pendant la mesure : si un \
+                 problème est apparu au même moment, c'est une piste (bascule d'opérateur \
+                 ou de lien).",
+                list(&moved)
+            ),
+        ));
+    }
+
     // ── Latence ──────────────────────────────────────────────────────────
     if let Some(dest_avg) = dest.avg_ms {
         // Plus grande marche de latence qui se maintient jusqu'au bout.
@@ -288,11 +328,18 @@ pub fn diagnose(hops: &[HopStat], reached: bool) -> Vec<Finding> {
                 finding(
                     Severity::Ok,
                     None,
-                    format!(
-                        "Chemin sain : {} sauts, {dest_avg:.0} ms en moyenne et {:.1} % de \
-                         perte à destination.",
-                        n, dest.loss_pct
-                    ),
+                    if dest_lost > 0.0 {
+                        format!(
+                            "Chemin sain : {n} sauts, {dest_avg:.0} ms en moyenne à destination \
+                             ({dest_lost:.0} paquet(s) perdu(s) sur {}, non significatif).",
+                            dest.sent
+                        )
+                    } else {
+                        format!(
+                            "Chemin sain : {n} sauts, {dest_avg:.0} ms en moyenne et aucune \
+                             perte à destination."
+                        )
+                    },
                 ),
             );
         }
@@ -313,7 +360,7 @@ mod tests {
     use super::*;
 
     fn hop(ttl: u8, loss: f64, avg: Option<f64>) -> HopStat {
-        HopStat { ttl, sent: 100, loss_pct: loss, avg_ms: avg, jitter_ms: Some(1.0) }
+        HopStat { ttl, sent: 100, loss_pct: loss, avg_ms: avg, jitter_ms: Some(1.0), route_changes: 0 }
     }
 
     fn path(spec: &[(f64, Option<f64>)]) -> Vec<HopStat> {
@@ -387,6 +434,17 @@ mod tests {
         let mut p = path(&[(0.0, Some(1.0)), (5.0, Some(12.0))]);
         p.iter_mut().for_each(|h| h.sent = 20);
         assert_eq!(worst(&diagnose(&p, true)), Severity::Ok);
+    }
+
+    #[test]
+    fn route_flapping_and_single_change_are_reported_as_info() {
+        let mut p = path(&[(0.0, Some(1.0)), (0.0, Some(8.0)), (0.0, Some(12.0))]);
+        p[0].route_changes = 1;
+        p[1].route_changes = 9;
+        let f = diagnose(&p, true);
+        assert_eq!(worst(&f), Severity::Info);
+        assert!(f.iter().any(|x| x.ttl == Some(2) && x.text.contains("alternante")));
+        assert!(f.iter().any(|x| x.ttl == Some(1) && x.text.contains("Changement de route")));
     }
 
     #[test]
