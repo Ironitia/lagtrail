@@ -1,0 +1,12 @@
+[package]
+name = "lagtrail"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dns-lookup = "2"
+eframe = "0.35.0"
+egui_extras = "0.35"
+egui_plot = "0.36"
+rfd = { version = "0.18.0", default-features = false, features = ["gtk3"] }
+socket2 = { version = "0.5", features = ["all"] }
