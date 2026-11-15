@@ -855,7 +855,9 @@ mod tests {
 
     #[test]
     fn html_path_gets_target_suffix() {
-        assert_eq!(suffixed_path("out/r.html", "a.example"), "out/r-a.example.html");
+        // Le séparateur rendu est celui du système (`\\` sous Windows).
+        let expected = std::path::Path::new("out").join("r-a.example.html");
+        assert_eq!(suffixed_path("out/r.html", "a.example"), expected.to_string_lossy());
         assert_eq!(suffixed_path("rapport", "::1"), "rapport-__1");
     }
 }
