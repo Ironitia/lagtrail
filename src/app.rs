@@ -16,7 +16,7 @@ use egui_plot::{HLine, Legend, Line, Plot, PlotPoints, Points};
 use crate::config::{self, SavedState, TraceConfig};
 use crate::diagnosis::{Finding, Severity};
 use crate::engine::{self, EngineCmd, EngineMsg, ProbeProtocol};
-use crate::stats::{self, HopView, ReportMeta, fmt_ms};
+use crate::stats::{self, HopView, Journal, ReportMeta, fmt_elapsed, fmt_ms};
 
 /// Couleur d'une cellule « perte » selon le pourcentage.
 fn loss_color(pct: f64) -> egui::Color32 {
@@ -80,6 +80,29 @@ fn latency_bar(ui: &mut egui::Ui, hop: &HopView, scale_ms: f64, color: egui::Col
     p.circle_filled(egui::pos2(x(avg), y), 3.5, color);
 }
 
+/// Découpe l'historique d'un saut en segments continus (coupés aux
+/// timeouts) et renvoie aussi les instants de perte, placés à y = 0.
+fn split_history(h: &HopView) -> (Vec<Vec<[f64; 2]>>, Vec<[f64; 2]>) {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    let mut losses = Vec::new();
+    for (x, y) in &h.history {
+        match y {
+            Some(v) => current.push([*x, *v]),
+            None => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                losses.push([*x, 0.0]);
+            }
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    (segments, losses)
+}
+
 /// Échappe un champ CSV (guillemets si virgule, guillemet ou saut de ligne).
 fn csv_escape(s: &str) -> String {
     if s.contains([',', '"', '\n']) {
@@ -105,6 +128,12 @@ struct Session {
     hops: Vec<HopView>,
     /// Cache DNS inverse de la trace (adresse → nom).
     names: HashMap<IpAddr, String>,
+    /// Événements datés (coupures, pics, routes, alertes).
+    journal: Journal,
+    /// Sauts en alerte au tour précédent (pour journaliser les transitions).
+    prev_alerting: HashSet<u8>,
+    /// Le panneau du bas montre le journal plutôt que le graphe.
+    show_journal: bool,
     final_ttl: Option<u8>,
     selected: Option<usize>,
     x: f64,
@@ -136,6 +165,9 @@ impl Session {
             resolved: None,
             hops: Vec::new(),
             names: HashMap::new(),
+            journal: Journal::default(),
+            prev_alerting: HashSet::new(),
+            show_journal: false,
             final_ttl: None,
             selected: None,
             x: 0.0,
@@ -198,16 +230,31 @@ impl Session {
             .unwrap_or_else(|| self.target_input.trim().to_string())
     }
 
-    /// Rapport texte : en-tête, tableau aligné, diagnostic.
-    fn text_report(&self) -> String {
-        let meta = ReportMeta {
+    fn report_meta(&self) -> ReportMeta {
+        ReportMeta {
             target: self.target_name(),
             addr: self.resolved.as_ref().map(|(_, a)| *a),
             protocol: self.protocol.describe(self.port),
             interval_secs: self.interval_secs,
             elapsed_secs: self.x,
-        };
-        stats::text_report(&meta, &self.hops, self.final_ttl.is_some())
+        }
+    }
+
+    /// Rapport texte : en-tête, tableau aligné, diagnostic.
+    fn text_report(&self) -> String {
+        let meta = self.report_meta();
+        stats::text_report(&meta, &self.hops, self.final_ttl.is_some(), &self.journal)
+    }
+
+    /// Rapport HTML autonome (graphe, tableau, diagnostic, événements).
+    fn html_report(&self) -> String {
+        crate::html::html_report(
+            &self.report_meta(),
+            &self.hops,
+            self.final_ttl.is_some(),
+            &self.journal,
+            &stats::fmt_utc(std::time::SystemTime::now()),
+        )
     }
 
     /// Réglages mémorisables de cet onglet.
@@ -238,6 +285,42 @@ impl Session {
         s
     }
 
+    /// Journalise l'entrée et la sortie d'alerte de chaque saut.
+    fn log_alert_transitions(&mut self) {
+        // Sur les tout premiers tours les moyennes oscillent : on attend
+        // 10 mesures par saut pour ne pas noyer le journal.
+        let now: HashSet<u8> = self
+            .hops
+            .iter()
+            .filter(|h| h.sent >= 10 && self.hop_alerts(h))
+            .map(|h| h.ttl)
+            .collect();
+        let mut raised: Vec<u8> = now.difference(&self.prev_alerting).copied().collect();
+        let mut cleared: Vec<u8> = self.prev_alerting.difference(&now).copied().collect();
+        raised.sort_unstable();
+        cleared.sort_unstable();
+        for ttl in raised {
+            let detail = self
+                .hops
+                .get(ttl as usize - 1)
+                .map(|h| format!(" (moyenne {} ms, perte {:.0} %)", fmt_ms(h.avg()), h.loss_pct()))
+                .unwrap_or_default();
+            self.journal.push(
+                self.x,
+                Severity::Warning,
+                format!("Alerte : le saut #{ttl} dépasse un seuil{detail}"),
+            );
+        }
+        for ttl in cleared {
+            self.journal.push(
+                self.x,
+                Severity::Ok,
+                format!("Fin d'alerte : le saut #{ttl} repasse sous les seuils"),
+            );
+        }
+        self.prev_alerting = now;
+    }
+
     fn start(&mut self) {
         let target = self.target_input.trim().to_string();
         if target.is_empty() {
@@ -247,6 +330,8 @@ impl Session {
         self.error = None;
         self.hops.clear();
         self.names.clear();
+        self.journal = Journal::default();
+        self.prev_alerting.clear();
         self.final_ttl = None;
         self.selected = None;
         self.resolved = None;
@@ -279,13 +364,22 @@ impl Session {
                     self.resolved = Some((target, addr));
                 }
                 EngineMsg::Started => self.status = "Trace en cours…".to_string(),
-                EngineMsg::Round { final_ttl, samples } => {
+                EngineMsg::Round { final_ttl, samples, warmup } => {
                     self.final_ttl = final_ttl;
                     self.x = self
                         .start
                         .map(|s| s.elapsed().as_secs_f64())
                         .unwrap_or(self.x + 1.0);
-                    stats::apply_round(&mut self.hops, &self.names, self.x, final_ttl, &samples);
+                    stats::apply_round_ex(
+                        &mut self.hops,
+                        &self.names,
+                        &mut self.journal,
+                        self.x,
+                        final_ttl,
+                        &samples,
+                        warmup,
+                    );
+                    self.log_alert_transitions();
                     if let Some(ft) = final_ttl {
                         // Le saut final peut encore reculer aux tours suivants
                         // (réponse de la destination perdue au premier tour) :
@@ -389,6 +483,17 @@ impl Session {
                 .clicked()
             {
                 self.export_history();
+            }
+            if ui
+                .add_enabled(has, egui::Button::new("💾 Rapport HTML"))
+                .on_hover_text(
+                    "Enregistre une page autonome (graphe, tableau, diagnostic, \
+                     événements) à joindre à un ticket de support",
+                )
+                .clicked()
+            {
+                let page = self.html_report();
+                self.save_file("rapport", "html", page);
             }
             if ui
                 .add_enabled(has, egui::Button::new("📋 Copier le rapport"))
@@ -611,10 +716,52 @@ impl Session {
         self.selected = new_sel;
     }
 
+    /// Journal des événements, du plus récent au plus ancien.
+    fn journal_view(&mut self, ui: &mut egui::Ui) {
+        if self.journal.events.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Rien à signaler pour l'instant. Les coupures, pics de latence, \
+                     changements de route et alertes s'inscriront ici, datés depuis \
+                     le démarrage de la trace.",
+                )
+                .weak()
+                .italics(),
+            );
+            return;
+        }
+        if let Some(now) = self.hops.last().and_then(|h| h.history.back()).map(|p| p.0) {
+            let mut line = self.journal.outages(now).describe();
+            if let Some(c) = line.get_mut(0..1) {
+                c.make_ascii_uppercase();
+            }
+            ui.label(egui::RichText::new(line).weak());
+            ui.separator();
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for e in self.journal.events.iter().rev() {
+                let (color, icon) = severity_style(e.severity);
+                ui.horizontal(|ui| {
+                    ui.monospace(fmt_elapsed(e.t));
+                    ui.colored_label(color, icon);
+                    ui.label(&e.text);
+                });
+            }
+        });
+    }
+
     fn plot(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.strong("Latence dans le temps");
+            ui.selectable_value(&mut self.show_journal, false, "Latence dans le temps");
+            let n = self.journal.events.len();
+            let label = if n == 0 { "Journal".to_string() } else { format!("Journal ({n})") };
+            ui.selectable_value(&mut self.show_journal, true, label)
+                .on_hover_text("Coupures, pics de latence, changements de route, alertes");
+            if self.show_journal {
+                return;
+            }
             match self.selected.and_then(|i| self.hops.get(i)) {
                 Some(h) => {
                     ui.separator();
@@ -631,29 +778,21 @@ impl Session {
             }
         });
 
-        // Découpe l'historique en segments continus (coupés aux timeouts) et
-        // collecte les instants de perte pour les marquer en rouge.
-        let sel = self.selected.and_then(|i| self.hops.get(i));
-        let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
-        let mut current: Vec<[f64; 2]> = Vec::new();
-        let mut loss_pts: Vec<[f64; 2]> = Vec::new();
-        if let Some(h) = sel {
-            for (x, y) in &h.history {
-                match y {
-                    Some(v) => current.push([*x, *v]),
-                    None => {
-                        if !current.is_empty() {
-                            segments.push(std::mem::take(&mut current));
-                        }
-                        loss_pts.push([*x, 0.0]);
-                    }
-                }
-            }
-            if !current.is_empty() {
-                segments.push(current);
-            }
+        if self.show_journal {
+            self.journal_view(ui);
+            return;
         }
+
+        let sel = self.selected.and_then(|i| self.hops.get(i));
+        let (segments, loss_pts) = sel.map(split_history).unwrap_or_default();
         let avg = sel.and_then(|h| h.avg());
+        // Si le saut affiché n'est pas la destination, on superpose celle-ci
+        // en fond : on voit d'un coup d'œil si ses à-coups se propagent.
+        let dest = self
+            .final_ttl
+            .and(self.hops.last())
+            .filter(|d| sel.is_some_and(|h| h.ttl != d.ttl));
+        let (dest_segments, _) = dest.map(split_history).unwrap_or_default();
 
         Plot::new("latency_plot")
             .legend(Legend::default())
@@ -661,10 +800,32 @@ impl Session {
             .y_axis_label("latence (ms)")
             .include_y(0.0)
             .show(ui, |pui| {
+                let dest_color = egui::Color32::from_gray(128);
+                for (i, seg) in dest_segments.iter().filter(|s| s.len() > 1).enumerate() {
+                    let name = if i == 0 { "destination" } else { "" };
+                    pui.line(Line::new(name, PlotPoints::from(seg.clone())).color(dest_color));
+                }
                 let rtt_color = egui::Color32::from_rgb(95, 160, 235);
-                for (i, seg) in segments.iter().enumerate() {
-                    let name = if i == 0 { "RTT (ms)" } else { "" };
+                let mut isolated: Vec<[f64; 2]> = Vec::new();
+                let mut named = false;
+                for seg in &segments {
+                    if seg.len() == 1 {
+                        // Mesure isolée entre deux pertes : une ligne d'un
+                        // seul point serait invisible.
+                        isolated.push(seg[0]);
+                        continue;
+                    }
+                    let name = if named { "" } else { "RTT (ms)" };
+                    named = true;
                     pui.line(Line::new(name, PlotPoints::from(seg.clone())).color(rtt_color));
+                }
+                if !isolated.is_empty() {
+                    let name = if named { "" } else { "RTT (ms)" };
+                    pui.points(
+                        Points::new(name, PlotPoints::from(isolated))
+                            .color(rtt_color)
+                            .radius(2.0),
+                    );
                 }
                 if let Some(a) = avg {
                     pui.hline(HLine::new("moyenne", a));
@@ -723,25 +884,25 @@ impl Session {
 
     fn export_summary(&mut self) {
         let csv = self.summary_csv();
-        self.save_csv("resume", csv);
+        self.save_file("resume", "csv", csv);
     }
 
     fn export_history(&mut self) {
         let csv = self.history_csv();
-        self.save_csv("historique", csv);
+        self.save_file("historique", "csv", csv);
     }
 
-    /// Ouvre un dialogue « Enregistrer sous » et écrit le CSV.
-    fn save_csv(&mut self, kind: &str, contents: String) {
+    /// Ouvre un dialogue « Enregistrer sous » et écrit le fichier.
+    fn save_file(&mut self, kind: &str, ext: &str, contents: String) {
         let target = self.target_name();
         let safe: String = target
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
             .collect();
-        let name = format!("lagtrail-{safe}-{kind}.csv");
+        let name = format!("lagtrail-{safe}-{kind}.{ext}");
         if let Some(path) = rfd::FileDialog::new()
             .set_file_name(name)
-            .add_filter("CSV", &["csv"])
+            .add_filter(ext.to_uppercase(), &[ext])
             .save_file()
         {
             match std::fs::write(&path, contents) {
@@ -1055,7 +1216,25 @@ impl eframe::App for App {
 
         if self.overview {
             let mut open: Option<usize> = None;
-            egui::CentralPanel::default().show(ui, |ui| open = self.overview_table(ui));
+            egui::CentralPanel::default().show(ui, |ui| {
+                // « Est-ce ma connexion ou le site ? » : comparaison des
+                // cibles ayant assez de mesures pour être jugées.
+                let health: Vec<_> = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.hops.iter().any(|h| h.sent >= 10))
+                    .map(|s| stats::target_health(&s.target_name(), &s.hops, s.final_ttl.is_some()))
+                    .collect();
+                if let Some(f) = crate::diagnosis::compare_targets(&health) {
+                    let (color, icon) = severity_style(f.severity);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(color, icon);
+                        ui.label(&f.text);
+                    });
+                    ui.separator();
+                }
+                open = self.overview_table(ui);
+            });
             if let Some(i) = open {
                 self.active = i;
                 self.overview = false;
@@ -1121,6 +1300,13 @@ mod tests {
         assert_eq!(lines[1], "1.000,1,10.0.0.1,10.000");
         assert_eq!(lines[2], "2.000,1,10.0.0.1,"); // timeout → champ RTT vide
         assert_eq!(lines[3], "3.000,1,10.0.0.1,20.000");
+    }
+
+    #[test]
+    fn history_is_split_at_timeouts() {
+        let (segments, losses) = split_history(&hop_with_samples());
+        assert_eq!(segments, vec![vec![[1.0, 10.0]], vec![[3.0, 20.0]]]);
+        assert_eq!(losses, vec![[2.0, 0.0]]);
     }
 
     #[test]

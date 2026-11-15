@@ -96,8 +96,9 @@ pub fn diagnose(hops: &[HopStat], reached: bool) -> Vec<Finding> {
         let text = match last {
             Some(h) => format!(
                 "La destination ne répond pas. Dernier équipement visible : saut #{} — \
-                 la coupure (ou un pare-feu) se situe juste après. Essaie un autre \
-                 protocole (TCP 443) pour distinguer filtrage et panne.",
+                 la coupure (ou un pare-feu) se situe juste après. Compare avec un \
+                 autre protocole (ICMP, ou TCP sur un port ouvert comme 443) pour \
+                 distinguer filtrage et panne.",
                 h.ttl
             ),
             None => "Aucun équipement ne répond, pas même la passerelle : vérifie la \
@@ -355,9 +356,137 @@ pub fn diagnose(hops: &[HopStat], reached: bool) -> Vec<Finding> {
     out
 }
 
+/// État d'une cible, pour la comparaison entre cibles mesurées ensemble.
+#[derive(Debug, Clone)]
+pub struct TargetHealth {
+    pub name: String,
+    pub severity: Severity,
+    pub reached: bool,
+    /// Adresse répondante à chaque TTL (index 0 = saut 1).
+    pub path: Vec<Option<std::net::IpAddr>>,
+}
+
+impl TargetHealth {
+    fn degraded(&self) -> bool {
+        !self.reached || self.severity >= Severity::Warning
+    }
+}
+
+/// Nombre de premiers sauts identiques sur tous les chemins.
+fn shared_hops(items: &[TargetHealth]) -> usize {
+    let Some(first) = items.first() else { return 0 };
+    first
+        .path
+        .iter()
+        .enumerate()
+        .take_while(|(i, a)| a.is_some() && items.iter().all(|t| t.path.get(*i) == Some(*a)))
+        .count()
+}
+
+/// Répond à « est-ce ma connexion ou le site ? » en comparant plusieurs
+/// cibles mesurées en même temps. `None` s'il y a moins de deux cibles.
+pub fn compare_targets(items: &[TargetHealth]) -> Option<Finding> {
+    if items.len() < 2 {
+        return None;
+    }
+    let bad: Vec<&TargetHealth> = items.iter().filter(|t| t.degraded()).collect();
+    let finding = |severity, text| Some(Finding { severity, ttl: None, text });
+    if bad.is_empty() {
+        return finding(
+            Severity::Ok,
+            format!("Les {} cibles répondent normalement.", items.len()),
+        );
+    }
+    if bad.len() == items.len() {
+        let mut text = format!(
+            "Les {} cibles sont dégradées en même temps : la cause est très probablement \
+             commune — ton réseau local, ta box ou ton fournisseur d'accès — plutôt que \
+             chacune des cibles.",
+            items.len()
+        );
+        // Des chemins identiques de bout en bout (même destination) ne
+        // désignent aucun tronçon en particulier.
+        let shortest = items.iter().map(|t| t.path.len()).min().unwrap_or(0);
+        match shared_hops(items) {
+            0 => {}
+            n if n >= shortest => {}
+            1 => text.push_str(" Elles n'ont que le premier saut en commun : commence par là."),
+            n => text.push_str(&format!(
+                " Elles partagent les {n} premiers sauts : c'est là qu'il faut chercher."
+            )),
+        }
+        let severity = bad.iter().map(|t| t.severity).max().unwrap_or(Severity::Warning);
+        return finding(severity.max(Severity::Warning), text);
+    }
+    let names: Vec<&str> = bad.iter().map(|t| t.name.as_str()).collect();
+    let text = if names.len() == 1 {
+        format!(
+            "Seule {} est dégradée, les autres cibles vont bien : ta connexion n'est pas \
+             en cause, le problème est propre à cette cible ou à la fin de son chemin.",
+            names[0]
+        )
+    } else {
+        format!(
+            "{} sont dégradées, les autres cibles vont bien : ta connexion n'est pas en \
+             cause, le problème est propre à ces cibles ou à la fin de leur chemin.",
+            names.join(", ")
+        )
+    };
+    finding(Severity::Info, text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target(name: &str, severity: Severity, reached: bool, path: &[u8]) -> TargetHealth {
+        TargetHealth {
+            name: name.to_string(),
+            severity,
+            reached,
+            path: path.iter().map(|b| Some(std::net::IpAddr::from([10, 0, 0, *b]))).collect(),
+        }
+    }
+
+    #[test]
+    fn compare_needs_two_targets() {
+        assert!(compare_targets(&[target("a", Severity::Critical, true, &[1])]).is_none());
+    }
+
+    #[test]
+    fn compare_all_healthy() {
+        let f = compare_targets(&[
+            target("a", Severity::Ok, true, &[1, 2]),
+            target("b", Severity::Info, true, &[1, 3]),
+        ])
+        .unwrap();
+        assert_eq!(f.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn compare_all_degraded_points_to_shared_hops() {
+        let f = compare_targets(&[
+            target("a", Severity::Critical, true, &[1, 2, 3, 4]),
+            target("b", Severity::Warning, true, &[1, 2, 9]),
+            target("c", Severity::Ok, false, &[1, 2, 7, 8]),
+        ])
+        .unwrap();
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.text.contains("cause est très probablement commune"));
+        assert!(f.text.contains("partagent les 2 premiers sauts"));
+    }
+
+    #[test]
+    fn compare_single_bad_target_clears_the_connection() {
+        let f = compare_targets(&[
+            target("a", Severity::Ok, true, &[1, 2]),
+            target("b", Severity::Critical, true, &[1, 3]),
+            target("c", Severity::Ok, true, &[1, 4]),
+        ])
+        .unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.text.starts_with("Seule b est dégradée"));
+    }
 
     fn hop(ttl: u8, loss: f64, avg: Option<f64>) -> HopStat {
         HopStat { ttl, sent: 100, loss_pct: loss, avg_ms: avg, jitter_ms: Some(1.0), route_changes: 0 }

@@ -92,6 +92,10 @@ pub enum EngineMsg {
     Round {
         final_ttl: Option<u8>,
         samples: Vec<HopSample>,
+        /// Tour de découverte : la longueur du chemin n'était pas connue,
+        /// toutes les sondes au-delà du dernier saut ont frappé la
+        /// destination en rafale. Sert à révéler le chemin, pas aux stats.
+        warmup: bool,
     },
     /// Nom (DNS inverse) d'une adresse rencontrée sur le chemin.
     HopName { addr: IpAddr, name: String },
@@ -183,6 +187,56 @@ fn bump(reached: &mut Option<u8>, ttl: u8) {
     *reached = Some(v);
 }
 
+/// Nature d'une réponse appariée à l'une de nos sondes.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    Echo,
+    Error(ErrKind),
+}
+
+/// Identifiant ICMP propre à chaque sondeur. Un socket ICMP brut reçoit
+/// *toutes* les réponses ICMP de la machine : sans identifiant distinct, deux
+/// traces simultanées (onglets, rapport multi-cibles) s'attribueraient les
+/// réponses l'une de l'autre.
+fn next_ident() -> u16 {
+    static COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ((std::process::id() as u16) ^ 0x7f7f).wrapping_add(n.wrapping_mul(0x9e37))
+}
+
+/// Si `m` répond à l'une des sondes de ce sondeur, renvoie la clé sous
+/// laquelle elle a été enregistrée à l'envoi (numéro de séquence ICMP, port
+/// de destination UDP, port source TCP) et la nature de la réponse.
+/// Les réponses destinées à une autre trace sont écartées : identifiant ICMP
+/// différent, ou port source UDP qui n'est pas le nôtre.
+fn probe_key(
+    protocol: ProbeProtocol,
+    ident: u16,
+    udp_port: Option<u16>,
+    m: &Matched,
+) -> Option<(u16, Reply)> {
+    match (protocol, m) {
+        (ProbeProtocol::Icmp, Matched::Echo { ident: i, seq }) if *i == ident => {
+            Some((*seq, Reply::Echo))
+        }
+        (ProbeProtocol::Icmp, Matched::Error { kind, inner: Inner::Icmp { ident: i, seq } })
+            if *i == ident =>
+        {
+            Some((*seq, Reply::Error(*kind)))
+        }
+        (ProbeProtocol::Udp, Matched::Error { kind, inner: Inner::Udp { src_port, dst_port } })
+            if udp_port.is_none_or(|p| p == *src_port) =>
+        {
+            Some((*dst_port, Reply::Error(*kind)))
+        }
+        // Le port source d'une connexion TCP est déjà unique sur la machine.
+        (ProbeProtocol::Tcp, Matched::Error { kind, inner: Inner::Tcp { src_port, .. } }) => {
+            Some((*src_port, Reply::Error(*kind)))
+        }
+        _ => None,
+    }
+}
+
 /// Sondeur : détient le socket de réception (et le socket UDP si besoin).
 pub struct Prober {
     protocol: ProbeProtocol,
@@ -191,6 +245,8 @@ pub struct Prober {
     is_v6: bool,
     recv: Socket,
     udp: Option<Socket>,
+    /// Port source de nos sondes UDP (sert à reconnaître leurs réponses).
+    udp_port: Option<u16>,
     ident: u16,
     port_ctr: u16,
 }
@@ -207,10 +263,24 @@ impl Prober {
         let recv = Socket::new(domain, Type::RAW, Some(icmp_proto))?;
         recv.set_read_timeout(Some(Duration::from_millis(100)))?;
         let udp = if protocol == ProbeProtocol::Udp {
-            Some(Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?)
+            let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+            // Port source fixé dès maintenant, pour pouvoir le reconnaître
+            // dans les erreurs ICMP qui citent nos sondes.
+            let any: IpAddr = if is_v6 {
+                std::net::Ipv6Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            };
+            s.bind(&sockaddr(any, 0))?;
+            Some(s)
         } else {
             None
         };
+        let udp_port = udp
+            .as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .and_then(|a| sockaddr_port(&a))
+            .filter(|p| *p != 0);
         Ok(Self {
             protocol,
             target,
@@ -218,7 +288,8 @@ impl Prober {
             is_v6,
             recv,
             udp,
-            ident: (std::process::id() as u16) ^ 0x7f7f,
+            udp_port,
+            ident: next_ident(),
             port_ctr: 0,
         })
     }
@@ -233,53 +304,21 @@ impl Prober {
         results: &mut HashMap<u8, (Option<IpAddr>, f64)>,
         reached: &mut Option<u8>,
     ) {
-        match self.protocol {
-            ProbeProtocol::Icmp => match m {
-                Matched::Echo { ident, seq } if ident == self.ident => {
-                    if let Some((ttl, t0)) = sent_at.remove(&seq) {
-                        results.insert(ttl, (responder.or(Some(self.target)), dur_ms(now - t0)));
-                        bump(reached, ttl);
-                    }
-                }
-                Matched::Error {
-                    kind,
-                    inner: Inner::Icmp { ident, seq },
-                } if ident == self.ident => {
-                    if let Some((ttl, t0)) = sent_at.remove(&seq) {
-                        results.entry(ttl).or_insert((responder, dur_ms(now - t0)));
-                        if kind == ErrKind::Unreachable {
-                            bump(reached, ttl);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            ProbeProtocol::Udp => {
-                if let Matched::Error {
-                    kind,
-                    inner: Inner::Udp { dst_port, .. },
-                } = m
-                {
-                    if let Some((ttl, t0)) = sent_at.remove(&dst_port) {
-                        results.entry(ttl).or_insert((responder, dur_ms(now - t0)));
-                        if kind == ErrKind::Unreachable {
-                            bump(reached, ttl);
-                        }
-                    }
-                }
+        let Some((key, reply)) = probe_key(self.protocol, self.ident, self.udp_port, &m) else {
+            return;
+        };
+        let Some((ttl, t0)) = sent_at.remove(&key) else {
+            return;
+        };
+        match reply {
+            Reply::Echo => {
+                results.insert(ttl, (responder.or(Some(self.target)), dur_ms(now - t0)));
+                bump(reached, ttl);
             }
-            ProbeProtocol::Tcp => {
-                if let Matched::Error {
-                    kind,
-                    inner: Inner::Tcp { src_port, .. },
-                } = m
-                {
-                    if let Some((ttl, t0)) = sent_at.remove(&src_port) {
-                        results.entry(ttl).or_insert((responder, dur_ms(now - t0)));
-                        if kind == ErrKind::Unreachable {
-                            bump(reached, ttl);
-                        }
-                    }
+            Reply::Error(kind) => {
+                results.entry(ttl).or_insert((responder, dur_ms(now - t0)));
+                if kind == ErrKind::Unreachable {
+                    bump(reached, ttl);
                 }
             }
         }
@@ -503,6 +542,7 @@ fn run_demo(
         }
     }
 
+    let mut tick = 0u32;
     let mut rng = 0x9E37_79B9_7F4A_7C15u64
         ^ std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -521,15 +561,24 @@ fn run_demo(
         }
 
         let round_start = Instant::now();
+        tick += 1;
+        // Scénario cyclique à destination : une courte coupure puis un pic,
+        // pour illustrer le journal d'événements.
+        let phase = tick % 45;
+        let outage = (20..24).contains(&phase);
+        let spike = phase == 35;
         let mut samples = Vec::with_capacity(path.len());
         for (i, (ip, base, _)) in path.iter().enumerate() {
             let (loss_pct, span) = match i {
                 5 => (18u64, 30.0),
-                7 => (10, 12.0),
+                7 => (4, 12.0),
                 _ => (3, 6.0),
             };
-            let rtt = if (xorshift(&mut rng) % 100) < loss_pct {
+            let is_dest = i == path.len() - 1;
+            let rtt = if (is_dest && outage) || (xorshift(&mut rng) % 100) < loss_pct {
                 None
+            } else if is_dest && spike {
+                Some(base * 5.0)
             } else {
                 let jitter = ((xorshift(&mut rng) % 1000) as f64 / 1000.0 - 0.5) * span;
                 Some((base + jitter).max(0.3))
@@ -548,6 +597,7 @@ fn run_demo(
         let _ = msg_tx.send(EngineMsg::Round {
             final_ttl: Some(final_ttl),
             samples,
+            warmup: false,
         });
         repaint();
 
@@ -637,6 +687,7 @@ fn engine_loop(cmd_rx: Receiver<EngineCmd>, msg_tx: Sender<EngineMsg>, repaint: 
         let mut round: u8 = 0;
         let mut final_ttl: Option<u8> = None;
         let mut named: HashSet<IpAddr> = HashSet::new();
+        let mut first_round = true;
 
         let _ = msg_tx.send(EngineMsg::Started);
         repaint();
@@ -676,7 +727,9 @@ fn engine_loop(cmd_rx: Receiver<EngineCmd>, msg_tx: Sender<EngineMsg>, repaint: 
                     let _ = msg_tx.send(EngineMsg::Round {
                         final_ttl,
                         samples: outcome.samples,
+                        warmup: first_round && outcome.reached_ttl.is_some(),
                     });
+                    first_round = false;
                     repaint();
                 }
                 Err(e) => {
@@ -705,5 +758,44 @@ fn engine_loop(cmd_rx: Receiver<EngineCmd>, msg_tx: Sender<EngineMsg>, repaint: 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_prober_gets_its_own_icmp_ident() {
+        let ids: std::collections::HashSet<u16> = (0..64).map(|_| next_ident()).collect();
+        assert_eq!(ids.len(), 64);
+    }
+
+    #[test]
+    fn icmp_replies_of_another_trace_are_ignored() {
+        let echo = Matched::Echo { ident: 7, seq: 42 };
+        let err = Matched::Error {
+            kind: ErrKind::TimeExceeded,
+            inner: Inner::Icmp { ident: 7, seq: 43 },
+        };
+        let icmp = ProbeProtocol::Icmp;
+        assert_eq!(probe_key(icmp, 7, None, &echo), Some((42, Reply::Echo)));
+        assert_eq!(probe_key(icmp, 7, None, &err), Some((43, Reply::Error(ErrKind::TimeExceeded))));
+        assert_eq!(probe_key(icmp, 8, None, &echo), None);
+        assert_eq!(probe_key(icmp, 8, None, &err), None);
+    }
+
+    #[test]
+    fn udp_replies_are_matched_on_our_source_port() {
+        let err = Matched::Error {
+            kind: ErrKind::Unreachable,
+            inner: Inner::Udp { src_port: 50_000, dst_port: 33_440 },
+        };
+        let udp = ProbeProtocol::Udp;
+        let ours = Some((33_440, Reply::Error(ErrKind::Unreachable)));
+        assert_eq!(probe_key(udp, 0, Some(50_000), &err), ours);
+        assert_eq!(probe_key(udp, 0, Some(50_001), &err), None);
+        // Une erreur citant de l'UDP ne concerne pas une trace ICMP.
+        assert_eq!(probe_key(ProbeProtocol::Icmp, 0, None, &err), None);
     }
 }

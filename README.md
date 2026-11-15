@@ -66,6 +66,31 @@ lagtrail --help
 lagtrail --report exemple.com                       # 20 tours ICMP, tableau + diagnostic
 lagtrail --report exemple.com tcp 443 --rounds 60 --interval 0.5
 #   code de sortie : 0 = sain, 1 = attention, 2 = critique, 3 = erreur
+lagtrail --report exemple.com --json                # même rapport en JSON (sauts, coupures, constats, événements)
+lagtrail --report exemple.com 1.1.1.1 9.9.9.9 --rounds 30   # plusieurs cibles en parallèle :
+#   un rapport par cible puis une synthèse ; code de sortie = celui de la pire cible
+#   la synthèse compare les cibles : toutes dégradées = cause commune (réseau local,
+#   box, FAI, avec les sauts partagés) ; une seule = problème propre à cette cible.
+#   La vue d'ensemble de l'interface affiche la même conclusion.
+#   (--json rend un tableau, --html écrit un fichier par cible, suffixé par son nom)
+lagtrail --report exemple.com --html rapport.html   # page autonome : graphe, tableau, diagnostic, événements
+#   (un seul fichier sans script, à joindre à un ticket de support ; marche aussi avec --watch,
+#   écrit à l'arrêt ; même export par le bouton « Rapport HTML » de l'interface)
+
+# Surveillance continue dans le terminal (serveur, session SSH) :
+lagtrail --watch exemple.com --log trace.log
+#   une ligne horodatée en UTC par événement (coupure, rétablissement, pic,
+#   changement de route) et un point d'état par minute ; Ctrl-C (ou --rounds N)
+#   arrête avec un bilan : disponibilité, nombre et durée des coupures, diagnostic
+lagtrail --watch exemple.com --exec 'notify-send "lagtrail $LAGTRAIL_SEVERITY" "$LAGTRAIL_EVENT"'
+#   --exec lance une commande à chaque événement ; celui-ci est transmis par les
+#   variables LAGTRAIL_TARGET, LAGTRAIL_SEVERITY (CRITIQUE, ATTENTION, OK, info)
+#   et LAGTRAIL_EVENT
+
+lagtrail --watch exemple.com 1.1.1.1 --json --log trace.jsonl
+#   plusieurs cibles surveillées en parallèle (comparées dans le bilan) ; --json écrit
+#   une ligne JSON par événement : {"time", "target", "kind", "text"}, avec kind parmi
+#   note, info, warning, critical, recovered, status, summary, error
 
 # Diagnostic terminal (sans GUI). Protocole et port optionnels :
 lagtrail --selftest 8.8.8.8            # ICMP
@@ -91,6 +116,28 @@ pour afficher sa courbe de latence dans le temps (panneau du bas).
   gigue) et *Historique* (série temporelle complète, une ligne par tour × saut,
   timeouts en champ vide). Ouvre un dialogue « Enregistrer sous ».
 
+### Surveillance permanente (service systemd)
+
+`--watch` convient à un service utilisateur. Exemple
+`~/.config/systemd/user/lagtrail-watch.service` :
+
+```ini
+[Unit]
+Description=lagtrail — surveillance de la connexion
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/lagtrail --watch 1.1.1.1 exemple.com --interval 5 --log %h/lagtrail.log
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Puis `systemctl --user enable --now lagtrail-watch`. Le binaire doit avoir la
+capacité `cap_net_raw` (voir « Privilèges »). L'arrêt du service (SIGTERM)
+écrit le bilan final dans le journal, comme Ctrl-C.
+
 ## Diagnostic automatique
 
 Un traceroute se lit mal à l'œil nu : un routeur intermédiaire à 30 % de perte
@@ -115,6 +162,21 @@ tableau l'indique (🔀, avec la liste des adresses vues) et le diagnostic
 distingue une alternance régulière (répartition de charge) d'une bascule
 ponctuelle. La colonne `route_changes` figure dans le CSV résumé.
 
+**Journal d'événements** : l'onglet « Journal » du panneau du bas date ce qui
+s'est passé depuis le démarrage — destination injoignable (3 pertes d'affilée)
+puis rétablie, pic de latence, changement de route, entrée et sortie d'alerte.
+Utile sur une longue surveillance pour répondre à « quand est-ce arrivé ? ».
+Les derniers événements figurent aussi dans le rapport texte et `--report`.
+
+**Graphe** : quand le saut sélectionné n'est pas la destination, la courbe de
+celle-ci est superposée en gris — on voit si les à-coups d'un routeur se
+retrouvent au bout du chemin ou non. Une mesure isolée entre deux pertes est
+dessinée comme un point.
+
+**Tour de découverte** : le premier tour sert à révéler le chemin ; ses
+mesures ne comptent pas, car toutes les sondes au-delà du dernier saut
+frappent alors la destination en rafale et faussaient la perte affichée.
+
 **Onglets mémorisés** : lancé sans argument, lagtrail rouvre les onglets et le
 thème de la dernière fois (cibles, protocole, intervalle, seuils d'alerte),
 sans démarrer aucune trace. Fichier : `~/.config/lagtrail/session.conf`
@@ -131,7 +193,8 @@ ne modifie pas ce fichier.
 | `src/stats.rs`  | Agrégation par saut, changements de route, rapport texte (partagé GUI / `--report`). |
 | `src/config.rs` | Mémorisation des onglets et du thème (format texte, sans dépendance). |
 | `src/app.rs`    | Interface egui : barre de contrôle, tableau des sauts, graphe de latence. |
-| `src/main.rs`   | Point d'entrée : GUI par défaut, modes `--report` et `--selftest` sans interface. |
+| `src/html.rs`   | Rapport HTML autonome (graphe SVG, tableau, diagnostic, journal). |
+| `src/main.rs`   | Point d'entrée : GUI par défaut, modes `--report`, `--watch` et `--selftest` sans interface. |
 
 Le moteur et l'IHM sont découplés par deux canaux `mpsc` (`EngineCmd` ↔ `EngineMsg`),
 donc le réseau ne bloque jamais le rendu.
@@ -153,7 +216,12 @@ marqueurs de perte · export CSV (résumé + historique) · DNS inverse · mode 
 automatique** · rapport texte copiable · vue d'ensemble multi-cibles · barre
 min/moy/max par saut · intervalles de 0,2 s à 60 min (veille longue) ·
 détection des changements de route · mode `--report` scriptable · onglets
-mémorisés entre deux lancements.
+mémorisés entre deux lancements · journal d'événements daté · sortie JSON ·
+mode surveillance `--watch` · comparaison saut/destination sur le graphe ·
+bilan des coupures (disponibilité, durée cumulée) · commande sur événement `--exec` ·
+rapport HTML autonome avec graphe · rapport multi-cibles en parallèle ·
+comparaison entre cibles (« ma connexion ou le site ? ») ·
+surveillance multi-cibles et sortie JSON Lines · 95ᵉ centile de latence par saut (P95).
 
 ## Limites actuelles / pistes
 
@@ -161,9 +229,12 @@ mémorisés entre deux lancements.
   chemin Internet, avec des latences concordantes avec `mtr`. **IPv6 n'a pas
   pu être validé** (pas de route IPv6 sur la machine d'essai) : seul le parsing
   ICMPv6 est couvert par des tests unitaires.
-- Au premier tour, toutes les sondes au-delà du dernier saut atteignent la
-  destination en rafale ; une cible qui limite ses réponses (fréquent en UDP)
-  peut alors afficher une perte qui n'existe pas pour le trafic réel.
+- **Traces simultanées** (plusieurs onglets, rapport multi-cibles) : chaque
+  trace a son propre identifiant ICMP et, en UDP, reconnaît ses sondes à leur
+  port source, pour ne pas s'attribuer les réponses d'une autre. Couvert par
+  des tests unitaires, pas encore revérifié sur un vrai réseau.
+- Une cible qui limite fortement ses réponses (fréquent en UDP) peut encore
+  afficher un peu de perte fictive sur les tours qui suivent la découverte.
 - En TCP, la latence de la destination est mesurée à environ 1 ms près.
 - Les mesures elles-mêmes ne sont pas rechargées d'une session à l'autre
   (seuls les réglages le sont) ; export image : à faire.
