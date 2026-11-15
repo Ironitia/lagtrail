@@ -170,7 +170,40 @@ enum TcpState {
     Pending,
 }
 
-/// Déduit l'état d'un `connect()` TCP non-bloquant, de façon portable.
+/// Déduit l'état d'un `connect()` TCP non-bloquant.
+///
+/// Sous Windows, `getpeername()` réussit dès que la connexion est *lancée* :
+/// on ne peut donc pas s'y fier, il faut demander à `WSAPoll` si le socket est
+/// devenu inscriptible (connecté) ou en erreur (RST, injoignable).
+#[cfg(windows)]
+fn tcp_state(s: &Socket) -> TcpState {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{POLLERR, POLLHUP, POLLWRNORM, WSAPOLLFD, WSAPoll};
+    let mut fd = WSAPOLLFD {
+        fd: s.as_raw_socket() as usize,
+        events: POLLWRNORM,
+        revents: 0,
+    };
+    // SÛRETÉ : un seul descripteur valide, délai nul (pas d'attente).
+    let n = unsafe { WSAPoll(&mut fd, 1, 0) };
+    if n <= 0 {
+        return TcpState::Pending;
+    }
+    if fd.revents & (POLLERR | POLLHUP) != 0 {
+        return match s.take_error() {
+            Ok(Some(e)) if e.kind() == io::ErrorKind::ConnectionRefused => TcpState::Reached,
+            _ => TcpState::Failed,
+        };
+    }
+    if fd.revents & POLLWRNORM != 0 {
+        TcpState::Reached
+    } else {
+        TcpState::Pending
+    }
+}
+
+/// Déduit l'état d'un `connect()` TCP non-bloquant (Linux et autres Unix).
+#[cfg(not(windows))]
 fn tcp_state(s: &Socket) -> TcpState {
     if s.peer_addr().is_ok() {
         return TcpState::Reached;
@@ -243,7 +276,9 @@ pub struct Prober {
     target: IpAddr,
     port: u16,
     is_v6: bool,
-    recv: Socket,
+    /// Socket ICMP brut de réception. Absent sous Windows en ICMPv4 : on y
+    /// passe par l'API `IcmpSendEcho` (voir `win_icmp`).
+    recv: Option<Socket>,
     udp: Option<Socket>,
     /// Port source de nos sondes UDP (sert à reconnaître leurs réponses).
     udp_port: Option<u16>,
@@ -260,8 +295,18 @@ impl Prober {
         } else {
             Protocol::ICMPV4
         };
-        let recv = Socket::new(domain, Type::RAW, Some(icmp_proto))?;
-        recv.set_read_timeout(Some(Duration::from_millis(100)))?;
+        // Sous Windows, le pare-feu ne transmet pas les « Time Exceeded »
+        // ICMPv4 à un socket brut (seuls les Echo Reply passent) : les sauts
+        // intermédiaires resteraient muets. L'API IcmpSendEcho, celle de
+        // tracert, est traitée par le noyau et ne demande aucun privilège.
+        let use_icmp_api = cfg!(windows) && protocol == ProbeProtocol::Icmp && !is_v6;
+        let recv = if use_icmp_api {
+            None
+        } else {
+            let s = Socket::new(domain, Type::RAW, Some(icmp_proto))?;
+            s.set_read_timeout(Some(Duration::from_millis(100)))?;
+            Some(s)
+        };
         let udp = if protocol == ProbeProtocol::Udp {
             let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
             // Port source fixé dès maintenant, pour pouvoir le reconnaître
@@ -331,6 +376,14 @@ impl Prober {
         deadline: Instant,
         payload: &[u8],
     ) -> io::Result<RoundOutcome> {
+        #[cfg(windows)]
+        if self.recv.is_none() {
+            if let IpAddr::V4(t) = self.target {
+                let (results, reached) = win_icmp::round(t, probe_max, deadline, payload);
+                return Ok(make_outcome(probe_max, &results, reached));
+            }
+        }
+
         let mut sent_at: HashMap<u16, (u8, Instant)> = HashMap::new();
         let mut tcp: Vec<(u8, Socket, Instant)> = Vec::new();
 
@@ -344,9 +397,10 @@ impl Prober {
                     } else {
                         icmp::build_echo_request(self.ident, seq, payload)
                     };
-                    set_ttl_hops(&self.recv, self.is_v6, ttl)?;
+                    let recv = self.recv.as_ref().expect("socket ICMP brut");
+                    set_ttl_hops(recv, self.is_v6, ttl)?;
                     let now = Instant::now();
-                    self.recv.send_to(&pkt, &sockaddr(self.target, 0))?;
+                    recv.send_to(&pkt, &sockaddr(self.target, 0))?;
                     sent_at.insert(seq, (ttl, now));
                 }
                 ProbeProtocol::Udp => {
@@ -393,8 +447,9 @@ impl Prober {
             let to = remaining
                 .min(Duration::from_millis(slice))
                 .max(Duration::from_millis(1));
-            self.recv.set_read_timeout(Some(to))?;
-            match self.recv.recv_from(&mut buf) {
+            let recv = self.recv.as_ref().expect("socket ICMP brut");
+            recv.set_read_timeout(Some(to))?;
+            match recv.recv_from(&mut buf) {
                 Ok((n, from)) => {
                     let now = Instant::now();
                     let data = unsafe { assume_init(&buf[..n]) };
@@ -436,25 +491,138 @@ impl Prober {
             }
         }
 
-        let samples = (1..=probe_max)
-            .map(|ttl| match results.get(&ttl) {
-                Some((addr, rtt)) => HopSample {
-                    ttl,
-                    addr: *addr,
-                    rtt_ms: Some(*rtt),
-                },
-                None => HopSample {
-                    ttl,
-                    addr: None,
-                    rtt_ms: None,
-                },
-            })
-            .collect();
+        Ok(make_outcome(probe_max, &results, reached))
+    }
+}
 
-        Ok(RoundOutcome {
-            samples,
-            reached_ttl: reached,
+/// Met en forme le résultat d'un tour : un échantillon par TTL sondé.
+fn make_outcome(
+    probe_max: u8,
+    results: &HashMap<u8, (Option<IpAddr>, f64)>,
+    reached: Option<u8>,
+) -> RoundOutcome {
+    let samples = (1..=probe_max)
+        .map(|ttl| match results.get(&ttl) {
+            Some((addr, rtt)) => HopSample {
+                ttl,
+                addr: *addr,
+                rtt_ms: Some(*rtt),
+            },
+            None => HopSample {
+                ttl,
+                addr: None,
+                rtt_ms: None,
+            },
         })
+        .collect();
+    RoundOutcome {
+        samples,
+        reached_ttl: reached,
+    }
+}
+
+/// Sondes ICMPv4 par l'API Windows `IcmpSendEcho` (iphlpapi), comme tracert.
+///
+/// `IcmpSendEcho` est bloquant : chaque TTL est sondé dans son propre thread,
+/// toutes les sondes partent donc ensemble comme avec le socket brut. Le RTT
+/// est chronométré ici (à la microseconde) plutôt que lu dans
+/// `RoundTripTime`, arrondi à la milliseconde.
+#[cfg(windows)]
+mod win_icmp {
+    use super::{IpAddr, Instant, dur_ms};
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        ICMP_ECHO_REPLY, IP_DEST_HOST_UNREACHABLE, IP_DEST_NET_UNREACHABLE,
+        IP_DEST_PORT_UNREACHABLE, IP_DEST_PROT_UNREACHABLE, IP_OPTION_INFORMATION, IP_SUCCESS,
+        IP_TTL_EXPIRED_TRANSIT, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    };
+
+    enum Answer {
+        Echo,
+        TtlExpired,
+        Unreachable,
+    }
+
+    /// Envoie un Echo de TTL donné et attend la réponse au plus `timeout_ms`.
+    fn probe(target: Ipv4Addr, ttl: u8, timeout_ms: u32, payload: &[u8]) -> Option<(Answer, IpAddr, f64)> {
+        // SÛRETÉ : appels FFI documentés ; le tampon de réponse est assez grand
+        // pour une ICMP_ECHO_REPLY suivie de la charge utile renvoyée (+ marge
+        // pour un message d'erreur ICMP, exigée par la documentation).
+        unsafe {
+            let h = IcmpCreateFile();
+            if h == INVALID_HANDLE_VALUE || h.is_null() {
+                return None;
+            }
+            let opts = IP_OPTION_INFORMATION {
+                Ttl: ttl,
+                ..Default::default()
+            };
+            let reply_size = std::mem::size_of::<ICMP_ECHO_REPLY>() + payload.len() + 8 + 64;
+            // Tampon aligné sur 8 octets (la structure contient un pointeur).
+            let mut buf = vec![0u64; reply_size.div_ceil(8)];
+            let t0 = Instant::now();
+            let n = IcmpSendEcho(
+                h,
+                u32::from_ne_bytes(target.octets()),
+                payload.as_ptr().cast(),
+                payload.len() as u16,
+                &opts,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                timeout_ms.max(1),
+            );
+            let rtt = dur_ms(Instant::now() - t0);
+            IcmpCloseHandle(h);
+            let r = &*(buf.as_ptr() as *const ICMP_ECHO_REPLY);
+            // Selon la version de Windows, un « TTL expiré » peut renvoyer 0
+            // tout en remplissant la réponse : on se fie au statut et à l'adresse.
+            if n == 0 && r.Address == 0 {
+                return None;
+            }
+            let from = IpAddr::V4(Ipv4Addr::from(r.Address.to_ne_bytes()));
+            let answer = match r.Status {
+                IP_SUCCESS => Answer::Echo,
+                IP_TTL_EXPIRED_TRANSIT => Answer::TtlExpired,
+                IP_DEST_HOST_UNREACHABLE
+                | IP_DEST_NET_UNREACHABLE
+                | IP_DEST_PORT_UNREACHABLE
+                | IP_DEST_PROT_UNREACHABLE => Answer::Unreachable,
+                _ => return None,
+            };
+            Some((answer, from, rtt))
+        }
+    }
+
+    /// Un tour complet : TTL 1..=probe_max sondés en parallèle jusqu'à `deadline`.
+    pub fn round(
+        target: Ipv4Addr,
+        probe_max: u8,
+        deadline: Instant,
+        payload: &[u8],
+    ) -> (HashMap<u8, (Option<IpAddr>, f64)>, Option<u8>) {
+        let timeout_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        let answers: Vec<(u8, Option<(Answer, IpAddr, f64)>)> = std::thread::scope(|sc| {
+            let handles: Vec<_> = (1..=probe_max)
+                .map(|ttl| sc.spawn(move || (ttl, probe(target, ttl, timeout_ms, payload))))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+
+        let mut results = HashMap::new();
+        let mut reached: Option<u8> = None;
+        for (ttl, a) in answers {
+            let Some((answer, from, rtt)) = a else { continue };
+            results.insert(ttl, (Some(from), rtt));
+            if matches!(answer, Answer::Echo | Answer::Unreachable) {
+                super::bump(&mut reached, ttl);
+            }
+        }
+        (results, reached)
     }
 }
 
