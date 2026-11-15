@@ -25,6 +25,8 @@ pub struct TraceConfig {
 pub struct SavedState {
     /// « system », « light » ou « dark ».
     pub theme: String,
+    /// Agrandissement de l'interface (1.0 = 100 %).
+    pub zoom: f32,
     pub traces: Vec<TraceConfig>,
 }
 
@@ -64,7 +66,10 @@ fn parse_trace(line: &str) -> Option<TraceConfig> {
 
 impl SavedState {
     pub fn to_text(&self) -> String {
-        let mut out = format!("# lagtrail — onglets mémorisés\ntheme={}\n", self.theme);
+        let mut out = format!(
+            "# lagtrail — onglets mémorisés\ntheme={}\nzoom={}\n",
+            self.theme, self.zoom
+        );
         for t in &self.traces {
             // La cible ne doit pas casser le format ligne/tabulation.
             let target: String = t.target.chars().filter(|c| !c.is_control()).collect();
@@ -86,11 +91,17 @@ impl SavedState {
 
     /// Lecture tolérante : les lignes inconnues ou invalides sont ignorées.
     pub fn from_text(text: &str) -> Self {
-        let mut state = SavedState { theme: "system".into(), traces: Vec::new() };
+        let mut state = SavedState { theme: "system".into(), zoom: 1.0, traces: Vec::new() };
         for line in text.lines() {
             if let Some(v) = line.strip_prefix("theme=") {
                 if matches!(v.trim(), "system" | "light" | "dark") {
                     state.theme = v.trim().to_string();
+                }
+            } else if let Some(v) = line.strip_prefix("zoom=") {
+                if let Ok(z) = v.trim().parse::<f32>() {
+                    if z.is_finite() {
+                        state.zoom = z.clamp(0.5, 3.0);
+                    }
                 }
             } else if let Some(v) = line.strip_prefix("trace=") {
                 if let Some(t) = parse_trace(v) {
@@ -134,6 +145,7 @@ mod tests {
     fn roundtrip() {
         let s = SavedState {
             theme: "dark".into(),
+            zoom: 1.3,
             traces: vec![
                 TraceConfig {
                     target: "exemple.com".into(),

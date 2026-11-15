@@ -1869,6 +1869,7 @@ dependencies = [
  "egui_plot",
  "rfd",
  "socket2 0.5.10",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

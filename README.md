@@ -177,11 +177,26 @@ dessinée comme un point.
 mesures ne comptent pas, car toutes les sondes au-delà du dernier saut
 frappent alors la destination en rafale et faussaient la perte affichée.
 
+**Taille d'affichage** : les boutons « A− / A+ » de la barre du haut (ou
+Ctrl +, Ctrl −, Ctrl 0) agrandissent ou réduisent toute l'interface, textes et
+graphes compris, de 50 % à 300 % — utile sur un écran très dense. Le réglage
+est mémorisé.
+
+**Plusieurs graphes** : cliquer un saut du tableau ouvre son graphe sous le
+tableau, cliquer à nouveau (ou ❌) le referme. Les graphes ouverts partagent
+leur axe du temps, ce qui permet de comparer un routeur intermédiaire à la
+destination au même instant.
+
+**Vue d'ensemble** : l'onglet « 📊 Vue d'ensemble » réunit toutes les traces
+dans un seul volet — état, perte, latence, mini-graphe de latence dans le
+temps et diagnostic de chaque cible — avec la comparaison entre cibles en
+tête. Un clic sur une ligne ouvre la trace en détail.
+
 **Onglets mémorisés** : lancé sans argument, lagtrail rouvre les onglets et le
 thème de la dernière fois (cibles, protocole, intervalle, seuils d'alerte),
 sans démarrer aucune trace. Fichier : `~/.config/lagtrail/session.conf`
 (`%APPDATA%\lagtrail` sous Windows). Un lancement avec des cibles en argument
-ne modifie pas ce fichier.
+n'y modifie que la taille d'affichage.
 
 ## Architecture
 
@@ -207,6 +222,12 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 (Le code réseau est déjà conditionné pour les deux plateformes via `socket2`.)
+
+**État sous Windows** : la CI compile le projet, lance les tests et exécute les
+modes `--report` et `--watch` sur la trace de démonstration sous Windows. En
+revanche, **aucune trace réelle n'a été validée sous Windows** : les sockets
+ICMP bruts y exigent les droits administrateur, et le pare-feu peut bloquer les
+réponses des routeurs intermédiaires.
 
 ## Fonctions
 

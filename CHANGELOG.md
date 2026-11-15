@@ -1,6 +1,27 @@
 # Journal des modifications
 
-## 0.2.0 — non publié
+## Non publié
+
+### Ajouts
+- Taille d'affichage réglable comme dans un navigateur : boutons « A− / A+ »
+  de la barre du haut ou Ctrl + / Ctrl − / Ctrl 0, de 50 % à 300 %, mémorisée.
+- Plusieurs graphes à la fois : cliquer un saut du tableau ouvre ou referme
+  son graphe ; les graphes ouverts partagent leur axe du temps.
+- Vue d'ensemble enrichie : mini-graphe de latence par cible, boutons « Tout
+  démarrer » / « Tout arrêter ».
+- Les réglages et les graphes sont plafonnés en hauteur et défilent, pour que
+  le tableau des sauts reste visible sur petit écran ou à fort zoom.
+
+### Corrections
+- Windows : `--report`, `--watch` et `--help` n'écrivaient rien dans le
+  terminal (le programme était compilé sans console). La console est
+  maintenant conservée, et refermée seulement au lancement par double-clic.
+
+### Divers
+- CI : compilation, tests et essais de bout en bout sur la trace de
+  démonstration, sous Linux et Windows.
+
+## 0.2.0
 
 ### Ajouts
 - Journal d'événements par trace : coupures, rétablissements, pics de latence,

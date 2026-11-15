@@ -11,3 +11,6 @@ egui_extras = "0.35"
 egui_plot = "0.36"
 rfd = { version = "0.18.0", default-features = false, features = ["gtk3"] }
 socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

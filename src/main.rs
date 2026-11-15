@@ -13,8 +13,6 @@
 //!   Linux :  sudo setcap cap_net_raw+ep <binaire>   (ou lancer avec sudo)
 //!   Windows: exécuter en administrateur
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod app;
 mod config;
 mod diagnosis;
@@ -57,6 +55,23 @@ fn print_help() {
     );
 }
 
+/// Sous Windows, le programme est une application console pour que
+/// `--report`, `--watch` et `--help` écrivent dans le terminal. Lancé par un
+/// double-clic, il reçoit une console rien que pour lui : on la referme avant
+/// d'ouvrir l'interface. Lancé depuis un terminal, on laisse celui-ci tranquille.
+#[cfg(windows)]
+fn hide_own_console() {
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut pids = [0u32; 2];
+    // Un seul processus attaché à la console : elle n'existe que pour nous.
+    if unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 2) } == 1 {
+        unsafe { FreeConsole() };
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_own_console() {}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -91,6 +106,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    hide_own_console();
     let targets: Vec<String> = args[1..]
         .iter()
         .filter(|a| !a.starts_with('-'))

@@ -80,6 +80,53 @@ fn latency_bar(ui: &mut egui::Ui, hop: &HopView, scale_ms: f64, color: egui::Col
     p.circle_filled(egui::pos2(x(avg), y), 3.5, color);
 }
 
+/// Mini-graphe de la latence d'un saut dans le temps (vue d'ensemble) :
+/// courbe interrompue aux pertes, pertes en traits rouges au pied.
+fn sparkline(ui: &mut egui::Ui, hop: &HopView) {
+    let size = egui::vec2(
+        ui.available_width().max(60.0),
+        (ui.available_height() - 8.0).max(18.0),
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (Some(first), Some(last)) = (hop.history.front(), hop.history.back()) else {
+        return;
+    };
+    let peak = hop.history.iter().filter_map(|p| p.1).fold(0.0f64, f64::max);
+    if peak <= 0.0 {
+        return;
+    }
+    let (x0, x1) = (first.0, last.0.max(first.0 + 1.0));
+    let px = |x: f64| rect.left() + ((x - x0) / (x1 - x0)) as f32 * rect.width();
+    let py = |y: f64| rect.bottom() - (y / (peak * 1.1)) as f32 * rect.height();
+    let p = ui.painter();
+    p.rect_filled(rect, 3.0, ui.visuals().faint_bg_color);
+    let (segments, losses) = split_history(hop);
+    let red = egui::Color32::from_rgb(220, 60, 60);
+    for l in &losses {
+        let x = px(l[0]);
+        p.line_segment(
+            [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - rect.height() * 0.3)],
+            egui::Stroke::new(1.5, red),
+        );
+    }
+    let color = egui::Color32::from_rgb(95, 160, 235);
+    for seg in &segments {
+        let pts: Vec<egui::Pos2> = seg.iter().map(|q| egui::pos2(px(q[0]), py(q[1]))).collect();
+        if pts.len() == 1 {
+            p.circle_filled(pts[0], 1.5, color);
+        } else {
+            p.add(egui::Shape::line(pts, egui::Stroke::new(1.4, color)));
+        }
+    }
+    resp.on_hover_text(format!(
+        "Latence à destination sur les {} dernières mesures\nmin {} ms · max {} ms · {} perte(s)",
+        hop.history.len(),
+        fmt_ms(hop.min()),
+        fmt_ms(hop.max()),
+        losses.len()
+    ));
+}
+
 /// Découpe l'historique d'un saut en segments continus (coupés aux
 /// timeouts) et renvoie aussi les instants de perte, placés à y = 0.
 fn split_history(h: &HopView) -> (Vec<Vec<[f64; 2]>>, Vec<[f64; 2]>) {
@@ -135,7 +182,8 @@ struct Session {
     /// Le panneau du bas montre le journal plutôt que le graphe.
     show_journal: bool,
     final_ttl: Option<u8>,
-    selected: Option<usize>,
+    /// Sauts (index) dont le graphe est ouvert, par TTL croissant.
+    graphs: Vec<usize>,
     x: f64,
     start: Option<Instant>,
     alerts_on: bool,
@@ -169,7 +217,7 @@ impl Session {
             prev_alerting: HashSet::new(),
             show_journal: false,
             final_ttl: None,
-            selected: None,
+            graphs: Vec::new(),
             x: 0.0,
             start: None,
             alerts_on: false,
@@ -333,7 +381,7 @@ impl Session {
         self.journal = Journal::default();
         self.prev_alerting.clear();
         self.final_ttl = None;
-        self.selected = None;
+        self.graphs.clear();
         self.resolved = None;
         self.x = 0.0;
         self.start = Some(Instant::now());
@@ -383,10 +431,18 @@ impl Session {
                     if let Some(ft) = final_ttl {
                         // Le saut final peut encore reculer aux tours suivants
                         // (réponse de la destination perdue au premier tour) :
-                        // une sélection devenue hors limites suit la destination.
+                        // les graphes devenus hors limites sont refermés, et à
+                        // défaut d'autre graphe on montre la destination.
                         let last = (ft as usize).saturating_sub(1);
-                        if self.selected.is_none_or(|i| i >= self.hops.len()) {
-                            self.selected = Some(last.min(self.hops.len().saturating_sub(1)));
+                        let len = self.hops.len();
+                        self.graphs.retain(|i| *i < len);
+                        if self.graphs.is_empty() && len > 0 {
+                            self.graphs.push(last.min(len - 1));
+                            // La démo ouvre aussi son saut « bruyant », pour
+                            // montrer les graphes multiples.
+                            if self.target_input.trim().eq_ignore_ascii_case("demo") && len > 6 {
+                                self.graphs.insert(0, 5);
+                            }
                         }
                     }
                 }
@@ -568,10 +624,14 @@ impl Session {
                             );
                             if let Some(ttl) = f.ttl {
                                 if resp
-                                    .on_hover_text(format!("Clique pour afficher le saut #{ttl}"))
+                                    .on_hover_text(format!("Clique pour ouvrir le graphe du saut #{ttl}"))
                                     .clicked()
                                 {
-                                    self.selected = Some(ttl as usize - 1);
+                                    let i = ttl as usize - 1;
+                                    if !self.graphs.contains(&i) {
+                                        self.toggle_graph(i);
+                                    }
+                                    self.show_journal = false;
                                 }
                             }
                         });
@@ -579,6 +639,18 @@ impl Session {
                 });
         }
         ui.add_space(4.0);
+    }
+
+    /// Ouvre ou referme le graphe d'un saut (il en reste toujours un).
+    fn toggle_graph(&mut self, i: usize) {
+        if let Some(pos) = self.graphs.iter().position(|g| *g == i) {
+            if self.graphs.len() > 1 {
+                self.graphs.remove(pos);
+            }
+        } else {
+            self.graphs.push(i);
+            self.graphs.sort_unstable();
+        }
     }
 
     fn table(&mut self, ui: &mut egui::Ui) {
@@ -598,7 +670,7 @@ impl Session {
         // Destination non atteinte : on masque la traîne de sauts muets.
         let shown = stats::visible_len(&self.hops, self.final_ttl.is_some());
         let hops = &self.hops[..shown];
-        let mut new_sel = self.selected;
+        let mut toggled: Option<usize> = None;
         // Échelle commune des barres : pire latence du chemin (les routeurs
         // anormalement lents écrasent sinon tout le reste → plafonnée).
         let dest_worst = hops.last().map(|h| h.worst).unwrap_or(0.0);
@@ -633,7 +705,7 @@ impl Session {
             })
             .body(|mut body| {
                 for (i, hop) in hops.iter().enumerate() {
-                    let selected = new_sel == Some(i);
+                    let selected = self.graphs.contains(&i);
                     body.row(row_h, |mut row| {
                         row.set_selected(selected);
                         let mut clicked = false;
@@ -706,14 +778,22 @@ impl Session {
                             };
                             latency_bar(ui, hop, scale_ms, color);
                         });
-                        if row.response().clicked() || clicked {
-                            new_sel = Some(i);
+                        if row
+                            .response()
+                            .on_hover_text("Clique pour ouvrir ou refermer le graphe de ce saut")
+                            .clicked()
+                            || clicked
+                        {
+                            toggled = Some(i);
                         }
                     });
                 }
             });
 
-        self.selected = new_sel;
+        if let Some(i) = toggled {
+            self.toggle_graph(i);
+            self.show_journal = false;
+        }
     }
 
     /// Journal des événements, du plus récent au plus ancien.
@@ -762,20 +842,13 @@ impl Session {
             if self.show_journal {
                 return;
             }
-            match self.selected.and_then(|i| self.hops.get(i)) {
-                Some(h) => {
-                    ui.separator();
-                    let label = h
-                        .name
-                        .clone()
-                        .or_else(|| h.addr.map(|a| a.to_string()))
-                        .unwrap_or_else(|| "*".into());
-                    ui.label(format!("Saut {} — {label}", h.ttl));
-                }
-                None => {
-                    ui.label(egui::RichText::new("(clique un saut dans le tableau)").weak());
-                }
-            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new(
+                    "Clique un saut du tableau pour ouvrir ou refermer son graphe",
+                )
+                .weak(),
+            );
         });
 
         if self.show_journal {
@@ -783,7 +856,55 @@ impl Session {
             return;
         }
 
-        let sel = self.selected.and_then(|i| self.hops.get(i));
+        let graphs: Vec<usize> =
+            self.graphs.iter().copied().filter(|i| *i < self.hops.len()).collect();
+        if graphs.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Le graphe apparaîtra dès les premières mesures.").weak());
+            return;
+        }
+        // Les graphes se partagent la hauteur du panneau ; au-delà de ce qui
+        // reste lisible, le panneau défile.
+        let n = graphs.len();
+        let title_h = egui::TextStyle::Body.resolve(ui.style()).size + 10.0;
+        let each = (ui.available_height() / n as f32 - title_h - 4.0).max(100.0);
+        let mut close = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (k, &i) in graphs.iter().enumerate() {
+                let hop = &self.hops[i];
+                ui.horizontal(|ui| {
+                    let label = hop
+                        .name
+                        .clone()
+                        .or_else(|| hop.addr.map(|a| a.to_string()))
+                        .unwrap_or_else(|| "*".into());
+                    ui.strong(format!("Saut {} — {label}", hop.ttl));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "moy. {} ms · perte {:.1} %",
+                            fmt_ms(hop.avg()),
+                            hop.loss_pct()
+                        ))
+                        .weak(),
+                    );
+                    if n > 1
+                        && ui.small_button("❌").on_hover_text("Refermer ce graphe").clicked()
+                    {
+                        close = Some(i);
+                    }
+                });
+                self.hop_plot(ui, i, each, k + 1 == n);
+            }
+        });
+        if let Some(i) = close {
+            self.toggle_graph(i);
+        }
+    }
+
+    /// Graphe de latence d'un saut. Les graphes d'une même trace partagent
+    /// leur axe du temps : zoomer ou déplacer l'un déplace les autres.
+    fn hop_plot(&self, ui: &mut egui::Ui, i: usize, height: f32, last: bool) {
+        let sel = self.hops.get(i);
         let (segments, loss_pts) = sel.map(split_history).unwrap_or_default();
         let avg = sel.and_then(|h| h.avg());
         // Si le saut affiché n'est pas la destination, on superpose celle-ci
@@ -794,12 +915,17 @@ impl Session {
             .filter(|d| sel.is_some_and(|h| h.ttl != d.ttl));
         let (dest_segments, _) = dest.map(split_history).unwrap_or_default();
 
-        Plot::new("latency_plot")
+        let mut plot = Plot::new(("latency_plot", i))
+            .height(height)
             .legend(Legend::default())
-            .x_axis_label("temps (s)")
             .y_axis_label("latence (ms)")
             .include_y(0.0)
-            .show(ui, |pui| {
+            .link_axis("lagtrail_time", [true, false])
+            .link_cursor("lagtrail_time", [true, false]);
+        if last {
+            plot = plot.x_axis_label("temps (s)");
+        }
+        plot.show(ui, |pui| {
                 let dest_color = egui::Color32::from_gray(128);
                 for (i, seg) in dest_segments.iter().filter(|s| s.len() > 1).enumerate() {
                     let name = if i == 0 { "destination" } else { "" };
@@ -931,6 +1057,9 @@ pub struct App {
     /// Affiche la vue d'ensemble (toutes les cibles) au lieu d'une trace.
     overview: bool,
     theme: egui::ThemePreference,
+    /// Agrandissement de toute l'interface (1.0 = 100 %), comme dans un
+    /// navigateur : boutons de la barre du haut ou Ctrl + / Ctrl − / Ctrl 0.
+    zoom: f32,
     /// Mémoriser les onglets à la fermeture (désactivé quand des cibles ont
     /// été passées en ligne de commande : lancement ponctuel).
     persist: bool,
@@ -966,6 +1095,7 @@ impl App {
                 _ => egui::ThemePreference::System,
             };
             ctx.set_theme(theme);
+            ctx.set_zoom_factor(saved.zoom.clamp(ZOOM_MIN, ZOOM_MAX));
             if restore {
                 sessions = saved.traces.iter().map(|c| Session::from_config(ctx, c)).collect();
             }
@@ -978,6 +1108,7 @@ impl App {
             sessions,
             active: 0,
             theme,
+            zoom: ctx.zoom_factor(),
             persist: restore,
         }
     }
@@ -991,6 +1122,7 @@ impl App {
                 egui::ThemePreference::System => "system",
             }
             .to_string(),
+            zoom: self.zoom,
             traces: self
                 .sessions
                 .iter()
@@ -1029,7 +1161,7 @@ impl App {
     /// session à ouvrir si une ligne a été cliquée.
     fn overview_table(&mut self, ui: &mut egui::Ui) -> Option<usize> {
         let mut open = None;
-        let row_h = egui::TextStyle::Body.resolve(ui.style()).size + 10.0;
+        let row_h = egui::TextStyle::Body.resolve(ui.style()).size + 34.0;
         TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())
@@ -1041,9 +1173,13 @@ impl App {
             .column(Column::exact(70.0))
             .column(Column::exact(70.0))
             .column(Column::exact(70.0))
+            .column(Column::initial(240.0).at_least(120.0))
             .column(Column::remainder().at_least(200.0))
-            .header(row_h, |mut h| {
-                for t in ["Cible", "État", "Proto.", "Sauts", "Perte", "Moy.", "Gigue", "Diagnostic"] {
+            .header(row_h * 0.6, |mut h| {
+                for t in [
+                    "Cible", "État", "Proto.", "Sauts", "Perte", "Moy.", "Gigue",
+                    "Latence dans le temps", "Diagnostic",
+                ] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -1091,6 +1227,12 @@ impl App {
                         row.col(|ui| {
                             ui.label(fmt_ms(dest.and_then(|d| d.jitter())));
                         });
+                        row.col(|ui| match dest {
+                            Some(d) => sparkline(ui, d),
+                            None => {
+                                ui.weak("—");
+                            }
+                        });
                         row.col(|ui| {
                             if let Some(err) = &s.error {
                                 let first = err.lines().next().unwrap_or_default();
@@ -1128,6 +1270,35 @@ impl App {
             theme_button(ui, &mut self.theme, egui::ThemePreference::System, "Auto");
             theme_button(ui, &mut self.theme, egui::ThemePreference::Light, "Clair");
             theme_button(ui, &mut self.theme, egui::ThemePreference::Dark, "Sombre");
+            ui.separator();
+            ui.label("Taille :");
+            let mut zoom = self.zoom;
+            if ui
+                .add_enabled(zoom > ZOOM_MIN, egui::Button::new("A−"))
+                .on_hover_text("Réduire tout l'affichage (Ctrl −)")
+                .clicked()
+            {
+                zoom -= ZOOM_STEP;
+            }
+            if ui
+                .button(format!("{:.0} %", zoom * 100.0))
+                .on_hover_text("Revenir à 100 % (Ctrl 0)")
+                .clicked()
+            {
+                zoom = 1.0;
+            }
+            if ui
+                .add_enabled(zoom < ZOOM_MAX, egui::Button::new("A+"))
+                .on_hover_text("Agrandir tout l'affichage (Ctrl +)")
+                .clicked()
+            {
+                zoom += ZOOM_STEP;
+            }
+            if zoom != self.zoom {
+                // Arrondi au pas pour éviter la dérive (1.2000001…).
+                let zoom = ((zoom / ZOOM_STEP).round() * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+                ui.ctx().set_zoom_factor(zoom);
+            }
         });
 
         ui.add_space(4.0);
@@ -1179,11 +1350,22 @@ fn theme_button(
     }
 }
 
+const ZOOM_MIN: f32 = 0.5;
+const ZOOM_MAX: f32 = 3.0;
+const ZOOM_STEP: f32 = 0.1;
+
 impl Drop for App {
     fn drop(&mut self) {
-        if self.persist {
-            let _ = config::save(&self.saved_state());
-        }
+        let state = if self.persist {
+            self.saved_state()
+        } else {
+            // Lancement ponctuel (cibles en argument) : les onglets mémorisés
+            // restent tels quels, seule la taille d'affichage est retenue.
+            let mut saved = config::load().unwrap_or_else(|| SavedState::from_text(""));
+            saved.zoom = self.zoom;
+            saved
+        };
+        let _ = config::save(&state);
     }
 }
 
@@ -1191,6 +1373,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Draine les messages de TOUTES les sessions (les traces de fond
         // continuent d'avancer même si leur onglet n'est pas actif).
+        // Suit aussi le zoom changé au clavier (Ctrl + / − / 0).
+        self.zoom = ui.ctx().zoom_factor();
         let mut any_running = false;
         for s in &mut self.sessions {
             s.apply_msgs();
@@ -1233,6 +1417,28 @@ impl eframe::App for App {
                     });
                     ui.separator();
                 }
+                ui.horizontal(|ui| {
+                    let any_stopped = self.sessions.iter().any(|s| !s.running);
+                    let any_started = self.sessions.iter().any(|s| s.running);
+                    if ui
+                        .add_enabled(any_stopped, egui::Button::new("▶ Tout démarrer"))
+                        .clicked()
+                    {
+                        for s in self.sessions.iter_mut().filter(|s| !s.running) {
+                            s.start();
+                        }
+                    }
+                    if ui.add_enabled(any_started, egui::Button::new("⏹ Tout arrêter")).clicked() {
+                        for s in self.sessions.iter_mut().filter(|s| s.running) {
+                            s.stop();
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new("Clique une ligne pour ouvrir la trace en détail")
+                            .weak(),
+                    );
+                });
+                ui.add_space(4.0);
                 open = self.overview_table(ui);
             });
             if let Some(i) = open {
@@ -1245,11 +1451,24 @@ impl eframe::App for App {
             return;
         }
 
-        egui::Panel::top("controls").show(ui, |ui| self.sessions[active].controls(ui));
+        // Avec un affichage agrandi ou une petite fenêtre, les réglages et
+        // les graphes ne doivent pas chasser le tableau des sauts : chacun est
+        // plafonné à une part de la hauteur et défile au-delà.
+        let screen_h = ui.ctx().content_rect().height();
+        egui::Panel::top("controls").show(ui, |ui| {
+            let cap = (screen_h * 0.36).max(90.0);
+            egui::ScrollArea::vertical()
+                .id_salt("controls_scroll")
+                .max_height(cap)
+                .min_scrolled_height(cap)
+                .show(ui, |ui| self.sessions[active].controls(ui));
+        });
+        let plot_max = (screen_h * 0.36).max(120.0);
         egui::Panel::bottom("plot")
             .resizable(true)
-            .default_size(240.0)
-            .min_size(140.0)
+            .default_size(330.0f32.min(plot_max))
+            .min_size(100.0f32.min(plot_max))
+            .max_size(plot_max)
             .show(ui, |ui| self.sessions[active].plot(ui));
         egui::CentralPanel::default().show(ui, |ui| self.sessions[active].table(ui));
 

@@ -7,11 +7,37 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Dépendances système (GTK3 pour le dialogue d'export)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
       - run: cargo test --locked
+      # Essais de bout en bout sur la trace de démonstration (sans privilèges,
+      # sans réseau) : les modes terminal doivent écrire leur sortie.
+      - name: Rapport de démonstration
+        shell: bash
+        run: |
+          set +e
+          cargo run --locked --quiet -- --report demo --rounds 15 --interval 0.2 --html rapport.html > rapport.txt
+          code=$?
+          cat rapport.txt
+          test "$code" -le 2
+          grep -q "rapport de trace vers demo" rapport.txt
+          grep -q "<svg" rapport.html
+      - name: Surveillance de démonstration (JSON Lines)
+        shell: bash
+        run: |
+          set +e
+          cargo run --locked --quiet -- --watch demo --rounds 15 --interval 0.2 --json > veille.jsonl
+          code=$?
+          cat veille.jsonl
+          test "$code" -le 2
+          grep -q '"kind": "summary"' veille.jsonl
