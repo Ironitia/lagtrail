@@ -1,8 +1,9 @@
 //! Interface graphique (egui / eframe).
 //!
 //! L'appli gère **plusieurs traces simultanées** : chaque onglet est une
-//! `Session` indépendante (sa cible, son thread moteur, ses mesures). Un
-//! sélecteur de thème clair/sombre/auto est disponible en haut.
+//! `Session` indépendante (sa cible, son thread moteur, ses mesures).
+//! Barre de menus : Fichier (traces, exports), Trace (démarrage, vue
+//! d'ensemble), Affichage (thème, taille), Aide (à propos, liens).
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -462,10 +463,14 @@ impl Session {
         }
     }
 
+    /// Panneau de réglages de la trace, en trois lignes : cible et
+    /// démarrage, paramètres de sonde, alertes. Les exports sont dans le menu
+    /// « Fichier » (et le bouton « Rapport » de la première ligne).
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        // ── Cible ──
         ui.horizontal(|ui| {
-            ui.label("Cible :");
+            ui.strong("Cible");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.target_input)
                     .desired_width(220.0)
@@ -479,8 +484,48 @@ impl Session {
             } else if ui.button("▶ Démarrer").clicked() || enter {
                 self.start();
             }
+            if ui
+                .add_enabled(!self.hops.is_empty(), egui::Button::new("📋 Copier le rapport"))
+                .on_hover_text(
+                    "Copie un rapport texte (tableau + diagnostic) prêt à coller \
+                     dans un ticket de support ou un e-mail.\n\
+                     Autres exports : menu Fichier.",
+                )
+                .clicked()
+            {
+                self.copy_report(ui.ctx());
+            }
             ui.separator();
-            ui.label("Intervalle :");
+            ui.label(egui::RichText::new(&self.status).weak());
+            if let Some((_, addr)) = &self.resolved {
+                ui.monospace(addr.to_string());
+            }
+        });
+        ui.add_space(2.0);
+        // ── Sonde ──
+        ui.horizontal(|ui| {
+            ui.strong("Sonde");
+            ui.add_enabled_ui(!self.running, |ui| {
+                ui.selectable_value(&mut self.protocol, ProbeProtocol::Icmp, "ICMP");
+                ui.selectable_value(&mut self.protocol, ProbeProtocol::Udp, "UDP");
+                ui.selectable_value(&mut self.protocol, ProbeProtocol::Tcp, "TCP");
+                if self.protocol.uses_port() {
+                    ui.label("port");
+                    ui.add(egui::DragValue::new(&mut self.port).range(1..=65535));
+                }
+                ui.checkbox(&mut self.prefer_v6, "IPv6")
+                    .on_hover_text("Résoudre et sonder en IPv6 (ICMPv6)");
+                ui.separator();
+                ui.label("max sauts");
+                let mut mh = self.max_hops as i32;
+                if ui.add(egui::DragValue::new(&mut mh).range(1..=64)).changed() {
+                    self.max_hops = mh.clamp(1, 64) as u8;
+                }
+            })
+            .response
+            .on_disabled_hover_text("Arrête la trace pour changer ces réglages");
+            ui.separator();
+            ui.label("intervalle");
             ui.add(
                 egui::DragValue::new(&mut self.interval_secs)
                     .range(0.2..=3600.0)
@@ -496,76 +541,12 @@ impl Session {
                         ui.selectable_value(&mut self.interval_secs, secs, label);
                     }
                 });
-            ui.label("Max sauts :");
-            let mut mh = self.max_hops as i32;
-            if ui
-                .add_enabled(!self.running, egui::DragValue::new(&mut mh).range(1..=64))
-                .changed()
-            {
-                self.max_hops = mh.clamp(1, 64) as u8;
-            }
         });
         ui.add_space(2.0);
-        ui.add_enabled_ui(!self.running, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Protocole :");
-                ui.selectable_value(&mut self.protocol, ProbeProtocol::Icmp, "ICMP");
-                ui.selectable_value(&mut self.protocol, ProbeProtocol::Udp, "UDP");
-                ui.selectable_value(&mut self.protocol, ProbeProtocol::Tcp, "TCP");
-                if self.protocol.uses_port() {
-                    ui.separator();
-                    ui.label("Port :");
-                    ui.add(egui::DragValue::new(&mut self.port).range(1..=65535));
-                }
-                ui.separator();
-                ui.checkbox(&mut self.prefer_v6, "IPv6")
-                    .on_hover_text("Résoudre et sonder en IPv6 (ICMPv6)");
-            });
-        });
-        ui.add_space(2.0);
+        // ── Alertes ──
         ui.horizontal(|ui| {
-            let has = !self.hops.is_empty();
-            ui.label("Export :");
-            if ui
-                .add_enabled(has, egui::Button::new("💾 Résumé CSV"))
-                .on_hover_text("Exporter le tableau actuel (une ligne par saut)")
-                .clicked()
-            {
-                self.export_summary();
-            }
-            if ui
-                .add_enabled(has, egui::Button::new("💾 Historique CSV"))
-                .on_hover_text("Exporter toute la série temporelle (tour × saut)")
-                .clicked()
-            {
-                self.export_history();
-            }
-            if ui
-                .add_enabled(has, egui::Button::new("💾 Rapport HTML"))
-                .on_hover_text(
-                    "Enregistre une page autonome (graphe, tableau, diagnostic, \
-                     événements) à joindre à un ticket de support",
-                )
-                .clicked()
-            {
-                let page = self.html_report();
-                self.save_file("rapport", "html", page);
-            }
-            if ui
-                .add_enabled(has, egui::Button::new("📋 Copier le rapport"))
-                .on_hover_text(
-                    "Copie un rapport texte (tableau + diagnostic) prêt à coller \
-                     dans un ticket de support ou un e-mail",
-                )
-                .clicked()
-            {
-                ui.ctx().copy_text(self.text_report());
-                self.status = "Rapport copié dans le presse-papiers.".to_string();
-            }
-        });
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.alerts_on, "Alertes");
+            ui.strong("Alertes");
+            ui.checkbox(&mut self.alerts_on, "activer");
             ui.add_enabled(
                 self.alerts_on,
                 egui::DragValue::new(&mut self.alert_latency)
@@ -582,14 +563,6 @@ impl Session {
                     .prefix("perte > ")
                     .suffix(" %"),
             );
-        });
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(&self.status).weak());
-            if let Some((_, addr)) = &self.resolved {
-                ui.separator();
-                ui.monospace(addr.to_string());
-            }
         });
         if let Some(err) = &self.error {
             ui.add_space(2.0);
@@ -1008,6 +981,16 @@ impl Session {
         out
     }
 
+    fn copy_report(&mut self, ctx: &egui::Context) {
+        ctx.copy_text(self.text_report());
+        self.status = "Rapport copié dans le presse-papiers.".to_string();
+    }
+
+    fn export_html(&mut self) {
+        let page = self.html_report();
+        self.save_file("rapport", "html", page);
+    }
+
     fn export_summary(&mut self) {
         let csv = self.summary_csv();
         self.save_file("resume", "csv", csv);
@@ -1063,6 +1046,32 @@ pub struct App {
     /// Mémoriser les onglets à la fermeture (désactivé quand des cibles ont
     /// été passées en ligne de commande : lancement ponctuel).
     persist: bool,
+    /// Fenêtre « À propos » ouverte.
+    about_open: bool,
+}
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
+fn open_link(ctx: &egui::Context, url: &str) {
+    ctx.open_url(egui::OpenUrl::new_tab(url));
+}
+
+/// Applique un facteur d'agrandissement, arrondi au pas et borné.
+fn set_zoom(ctx: &egui::Context, zoom: f32) {
+    // Arrondi au pas pour éviter la dérive (1.2000001…).
+    let zoom = ((zoom / ZOOM_STEP).round() * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+    ctx.set_zoom_factor(zoom);
+}
+
+/// Élément de menu avec son raccourci affiché à droite.
+fn menu_item(ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str) -> bool {
+    let mut b = egui::Button::new(label);
+    if !shortcut.is_empty() {
+        b = b.shortcut_text(shortcut);
+    }
+    ui.add_enabled(enabled, b).clicked()
 }
 
 impl App {
@@ -1110,6 +1119,7 @@ impl App {
             theme,
             zoom: ctx.zoom_factor(),
             persist: restore,
+            about_open: false,
         }
     }
 
@@ -1261,48 +1271,246 @@ impl App {
         open
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.heading("lagtrail");
-            ui.separator();
-            ui.label("Thème :");
-            theme_button(ui, &mut self.theme, egui::ThemePreference::System, "Auto");
-            theme_button(ui, &mut self.theme, egui::ThemePreference::Light, "Clair");
-            theme_button(ui, &mut self.theme, egui::ThemePreference::Dark, "Sombre");
-            ui.separator();
-            ui.label("Taille :");
-            let mut zoom = self.zoom;
-            if ui
-                .add_enabled(zoom > ZOOM_MIN, egui::Button::new("A−"))
-                .on_hover_text("Réduire tout l'affichage (Ctrl −)")
-                .clicked()
-            {
-                zoom -= ZOOM_STEP;
-            }
-            if ui
-                .button(format!("{:.0} %", zoom * 100.0))
-                .on_hover_text("Revenir à 100 % (Ctrl 0)")
-                .clicked()
-            {
-                zoom = 1.0;
-            }
-            if ui
-                .add_enabled(zoom < ZOOM_MAX, egui::Button::new("A+"))
-                .on_hover_text("Agrandir tout l'affichage (Ctrl +)")
-                .clicked()
-            {
-                zoom += ZOOM_STEP;
-            }
-            if zoom != self.zoom {
-                // Arrondi au pas pour éviter la dérive (1.2000001…).
-                let zoom = ((zoom / ZOOM_STEP).round() * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
-                ui.ctx().set_zoom_factor(zoom);
-            }
-        });
+    /// Trace concernée par les commandes du menu (aucune en vue d'ensemble).
+    fn current(&mut self) -> Option<&mut Session> {
+        if self.overview {
+            None
+        } else {
+            self.sessions.get_mut(self.active)
+        }
+    }
 
-        ui.add_space(4.0);
+    /// Barre de menus : Fichier, Trace, Affichage, Aide.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) -> Option<TabAction> {
         let mut action: Option<TabAction> = None;
+        let ctx = ui.ctx().clone();
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("Fichier", |ui| {
+                if menu_item(ui, true, "➕ Nouvelle trace", "Ctrl+T") {
+                    action = Some(TabAction::Add);
+                }
+                let can_close = !self.overview && !self.sessions.is_empty();
+                if menu_item(ui, can_close, "❌ Fermer la trace", "Ctrl+W") {
+                    action = Some(TabAction::Close(self.active));
+                }
+                ui.separator();
+                let has = self.current().is_some_and(|s| !s.hops.is_empty());
+                ui.add_enabled_ui(has, |ui| {
+                    ui.menu_button("💾 Exporter", |ui| {
+                        if let Some(s) = self.current() {
+                            if ui
+                                .button("Résumé CSV…")
+                                .on_hover_text("Une ligne par saut : perte, min/moy/max, gigue")
+                                .clicked()
+                            {
+                                s.export_summary();
+                            }
+                            if ui
+                                .button("Historique CSV…")
+                                .on_hover_text("Toute la série temporelle (tour × saut)")
+                                .clicked()
+                            {
+                                s.export_history();
+                            }
+                            if ui
+                                .button("Rapport HTML…")
+                                .on_hover_text(
+                                    "Page autonome (graphe, tableau, diagnostic, \
+                                     événements) à joindre à un ticket de support",
+                                )
+                                .clicked()
+                            {
+                                s.export_html();
+                            }
+                        }
+                    });
+                })
+                .response
+                .on_disabled_hover_text("Ouvre une trace qui a des mesures");
+                if menu_item(ui, has, "📋 Copier le rapport", "") {
+                    if let Some(s) = self.current() {
+                        s.copy_report(&ctx);
+                    }
+                }
+                ui.separator();
+                if menu_item(ui, true, "Quitter", "Ctrl+Q") {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+
+            ui.menu_button("Trace", |ui| {
+                let running = self.current().map(|s| s.running);
+                let label = if running == Some(true) { "⏹ Arrêter" } else { "▶ Démarrer" };
+                if menu_item(ui, running.is_some(), label, "") {
+                    if let Some(s) = self.current() {
+                        if s.running {
+                            s.stop();
+                        } else {
+                            s.start();
+                        }
+                    }
+                }
+                ui.separator();
+                let any_stopped = self.sessions.iter().any(|s| !s.running);
+                let any_running = self.sessions.iter().any(|s| s.running);
+                if menu_item(ui, any_stopped, "▶ Tout démarrer", "") {
+                    for s in self.sessions.iter_mut().filter(|s| !s.running) {
+                        s.start();
+                    }
+                }
+                if menu_item(ui, any_running, "⏹ Tout arrêter", "") {
+                    for s in self.sessions.iter_mut().filter(|s| s.running) {
+                        s.stop();
+                    }
+                }
+                ui.separator();
+                if ui.selectable_label(self.overview, "📊 Vue d'ensemble").clicked() {
+                    action = Some(if self.overview {
+                        TabAction::Select(self.active)
+                    } else {
+                        TabAction::Overview
+                    });
+                    ui.close();
+                }
+                let journal = self.current().map(|s| s.show_journal);
+                if ui
+                    .add_enabled(
+                        journal.is_some(),
+                        egui::Button::selectable(journal == Some(true), "🕑 Journal d'événements"),
+                    )
+                    .clicked()
+                {
+                    if let Some(s) = self.current() {
+                        s.show_journal = !s.show_journal;
+                    }
+                    ui.close();
+                }
+            });
+
+            ui.menu_button("Affichage", |ui| {
+                ui.label(egui::RichText::new("Thème").weak());
+                for (value, label) in [
+                    (egui::ThemePreference::System, "Auto (comme le système)"),
+                    (egui::ThemePreference::Light, "Clair"),
+                    (egui::ThemePreference::Dark, "Sombre"),
+                ] {
+                    if ui.radio_value(&mut self.theme, value, label).clicked() {
+                        ctx.set_theme(value);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("Taille de l'affichage : {:.0} %", self.zoom * 100.0))
+                        .weak(),
+                );
+                if menu_item(ui, self.zoom < ZOOM_MAX, "Agrandir", "Ctrl +") {
+                    set_zoom(&ctx, self.zoom + ZOOM_STEP);
+                }
+                if menu_item(ui, self.zoom > ZOOM_MIN, "Réduire", "Ctrl −") {
+                    set_zoom(&ctx, self.zoom - ZOOM_STEP);
+                }
+                if menu_item(ui, self.zoom != 1.0, "Taille normale (100 %)", "Ctrl 0") {
+                    set_zoom(&ctx, 1.0);
+                }
+            });
+
+            ui.menu_button("Aide", |ui| {
+                if menu_item(ui, true, "ℹ À propos de lagtrail", "") {
+                    self.about_open = true;
+                }
+                ui.separator();
+                if menu_item(ui, true, "🌐 Site Ironitia.com", "") {
+                    open_link(&ctx, HOMEPAGE);
+                }
+                if menu_item(ui, true, "📦 Projet sur GitHub", "") {
+                    open_link(&ctx, REPOSITORY);
+                }
+                if menu_item(ui, true, "🐞 Signaler un problème", "") {
+                    open_link(&ctx, &format!("{REPOSITORY}/issues"));
+                }
+            });
+        });
+        action
+    }
+
+    /// Fenêtre « À propos » : version, crédits et liens.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.about_open;
+        egui::Window::new("À propos de lagtrail")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading(egui::RichText::new("lagtrail").strong());
+                    ui.label(format!("version {VERSION}"));
+                    ui.add_space(6.0);
+                    ui.label("Traceroute visuel continu : latence et pertes saut par saut.");
+                    ui.add_space(10.0);
+                    ui.label("Conçu et développé par");
+                    ui.hyperlink_to(egui::RichText::new("Ironitia").size(18.0), HOMEPAGE);
+                    ui.add_space(6.0);
+                    ui.hyperlink_to("🌐 ironitia.com", HOMEPAGE);
+                    ui.hyperlink_to("📦 github.com/Ironitia/lagtrail", REPOSITORY);
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Logiciel libre sous licence MIT · © 2026 Ironitia")
+                            .small()
+                            .weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new("Interface : egui / eframe (Rust)").small().weak(),
+                    );
+                });
+            });
+        self.about_open = open;
+    }
+
+    /// Pied de page : crédits et liens.
+    fn credits_bar(ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let small = |t: &str| egui::RichText::new(t).small().weak();
+            ui.label(small(&format!("lagtrail v{VERSION} · par")));
+            ui.hyperlink_to(egui::RichText::new("Ironitia").small(), HOMEPAGE)
+                .on_hover_text(HOMEPAGE);
+            ui.label(small("·"));
+            ui.hyperlink_to(egui::RichText::new("ironitia.com").small(), HOMEPAGE);
+            ui.label(small("·"));
+            ui.hyperlink_to(egui::RichText::new("Code source sur GitHub").small(), REPOSITORY)
+                .on_hover_text(REPOSITORY);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(small("Licence MIT"));
+            });
+        });
+    }
+
+    /// Raccourcis clavier globaux (les zooms Ctrl +/−/0 sont gérés par egui).
+    fn shortcuts(&mut self, ctx: &egui::Context) -> Option<TabAction> {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        let (new, close, quit) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::T)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::W)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Q)),
+            )
+        });
+        if quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if new {
+            Some(TabAction::Add)
+        } else if close && !self.overview && !self.sessions.is_empty() {
+            Some(TabAction::Close(self.active))
+        } else {
+            None
+        }
+    }
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let mut action = self.menu_bar(ui);
+        ui.add_space(2.0);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui
@@ -1338,18 +1546,6 @@ impl App {
     }
 }
 
-fn theme_button(
-    ui: &mut egui::Ui,
-    current: &mut egui::ThemePreference,
-    value: egui::ThemePreference,
-    label: &str,
-) {
-    if ui.selectable_label(*current == value, label).clicked() {
-        *current = value;
-        ui.ctx().set_theme(value);
-    }
-}
-
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 3.0;
 const ZOOM_STEP: f32 = 0.1;
@@ -1381,7 +1577,13 @@ impl eframe::App for App {
             any_running |= s.running;
         }
 
+        let ctx = ui.ctx().clone();
+        if let Some(a) = self.shortcuts(&ctx) {
+            self.apply_tab_action(a, &ctx);
+        }
         egui::Panel::top("topbar").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("credits").show(ui, Self::credits_bar);
+        self.about_window(&ctx);
 
         if self.sessions.is_empty() {
             egui::CentralPanel::default().show(ui, |ui| {

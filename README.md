@@ -75,7 +75,7 @@ lagtrail --report exemple.com 1.1.1.1 9.9.9.9 --rounds 30   # plusieurs cibles e
 #   (--json rend un tableau, --html écrit un fichier par cible, suffixé par son nom)
 lagtrail --report exemple.com --html rapport.html   # page autonome : graphe, tableau, diagnostic, événements
 #   (un seul fichier sans script, à joindre à un ticket de support ; marche aussi avec --watch,
-#   écrit à l'arrêt ; même export par le bouton « Rapport HTML » de l'interface)
+#   écrit à l'arrêt ; même export par le menu Fichier ▸ Exporter ▸ Rapport HTML)
 
 # Surveillance continue dans le terminal (serveur, session SSH) :
 lagtrail --watch exemple.com --log trace.log
@@ -101,8 +101,15 @@ lagtrail --selftest exemple.com udp
 Le **mode démo** (`lagtrail demo`, ou cible `demo` dans l'IHM) génère une trace
 synthétique sans réseau ni privilèges — pratique pour découvrir l'interface.
 
-Dans la barre de contrôle : choix du **protocole** (ICMP / UDP / TCP), **port**
-(TCP/UDP), case **IPv6**. Protocole/port/IPv6 s'appliquent au prochain démarrage.
+**Menus** : *Fichier* (nouvelle trace Ctrl+T, fermer Ctrl+W, exports, copier le
+rapport, quitter Ctrl+Q), *Trace* (démarrer/arrêter, tout démarrer/arrêter, vue
+d'ensemble, journal), *Affichage* (thème, taille), *Aide* (à propos, liens vers
+[ironitia.com](https://ironitia.com) et le projet GitHub).
+
+Le panneau de réglages tient en trois lignes : **Cible** (saisie, démarrer,
+copier le rapport), **Sonde** (protocole ICMP / UDP / TCP, port, IPv6, nombre
+maximal de sauts, intervalle) et **Alertes**. Protocole/port/IPv6 s'appliquent
+au prochain démarrage.
 
 Dans l'interface : saisis une cible, « Démarrer ». Le tableau liste les sauts
 (adresse, nom inverse, perte %, dernier/moyen/min/max RTT, gigue). Clique un saut
@@ -111,8 +118,8 @@ pour afficher sa courbe de latence dans le temps (panneau du bas).
 - **Plusieurs traces** : « ➕ Nouvelle trace » ouvre un onglet ; chaque trace
   tourne en parallèle (son propre thread) et continue même en arrière-plan.
   « ✕ » ferme l'onglet.
-- **Thème** : sélecteur Auto / Clair / Sombre en haut.
-- **Export CSV** : deux boutons — *Résumé* (une ligne par saut : perte, min/moy/max,
+- **Thème** : Auto / Clair / Sombre dans le menu *Affichage*.
+- **Export CSV** (menu *Fichier ▸ Exporter*) : *Résumé* (une ligne par saut : perte, min/moy/max,
   gigue) et *Historique* (série temporelle complète, une ligne par tour × saut,
   timeouts en champ vide). Ouvre un dialogue « Enregistrer sous ».
 
@@ -177,7 +184,7 @@ dessinée comme un point.
 mesures ne comptent pas, car toutes les sondes au-delà du dernier saut
 frappent alors la destination en rafale et faussaient la perte affichée.
 
-**Taille d'affichage** : les boutons « A− / A+ » de la barre du haut (ou
+**Taille d'affichage** : le menu *Affichage* (ou
 Ctrl +, Ctrl −, Ctrl 0) agrandissent ou réduisent toute l'interface, textes et
 graphes compris, de 50 % à 300 % — utile sur un écran très dense. Le réglage
 est mémorisé.

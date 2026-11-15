@@ -2,6 +2,11 @@
 name = "lagtrail"
 version = "0.2.0"
 edition = "2024"
+authors = ["Ironitia"]
+description = "Traceroute visuel continu : latence et pertes saut par saut"
+license = "MIT"
+homepage = "https://ironitia.com"
+repository = "https://github.com/Ironitia/lagtrail"
 
 [dependencies]
 ctrlc = { version = "3", features = ["termination"] }
